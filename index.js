@@ -16,6 +16,8 @@ const TELEGRAM_API_BASE_URL = (process.env.TELEGRAM_API_BASE_URL || 'https://api
 const REQUEST_BODY_LIMIT = process.env.REQUEST_BODY_LIMIT || '5mb'
 const TELEGRAM_METHOD_RE = /^[A-Za-z][A-Za-z0-9_]*$/
 
+app.disable('x-powered-by')
+
 if (!['polling', 'webhook', 'off'].includes(BOT_MODE)) {
   throw new Error('BOT_MODE must be one of: polling, webhook, off')
 }
@@ -25,7 +27,7 @@ if (BOT_MODE === 'webhook' && !WEBHOOK_URL) {
 }
 
 const bot = new TelegramBot(BOT_TOKEN, {
-  polling: BOT_MODE === 'polling'
+  polling: false
 })
 
 app.use(express.json({ limit: REQUEST_BODY_LIMIT }))
@@ -86,6 +88,24 @@ app.get('/getMe', checkApiKey, legacyTelegramMethod('getMe'))
 app.post('/sendMessage', checkApiKey, legacyTelegramMethod('sendMessage', ['chat_id', 'text']))
 app.post('/sendPhoto', checkApiKey, legacyTelegramMethod('sendPhoto', ['chat_id', 'photo']))
 app.post('/setCommands', checkApiKey, legacyTelegramMethod('setMyCommands', ['commands']))
+app.post('/sendDocument', checkApiKey, legacyTelegramMethod('sendDocument', ['chat_id', 'document']))
+app.post('/sendSticker', checkApiKey, legacyTelegramMethod('sendSticker', ['chat_id', 'sticker']))
+app.post('/deleteMessage', checkApiKey, legacyTelegramMethod('deleteMessage', ['chat_id', 'message_id']))
+app.post('/banUser', checkApiKey, legacyTelegramMethod('banChatMember', ['chat_id', 'user_id']))
+app.post('/unbanUser', checkApiKey, legacyTelegramMethod('unbanChatMember', ['chat_id', 'user_id']))
+app.get('/getUpdates', checkApiKey, legacyTelegramMethod('getUpdates'))
+app.get('/getChat/:chatId', checkApiKey, (req, res, next) => {
+  Promise.resolve()
+    .then(async () => {
+      const telegramResponse = await callTelegram('getChat', {
+        ...cleanQuery(req.query),
+        chat_id: req.params.chatId
+      })
+
+      res.status(telegramResponse.status).json(telegramResponse.body)
+    })
+    .catch(next)
+})
 
 app.use((req, res) => {
   res.status(404).json({
@@ -130,8 +150,12 @@ function requireEnv(name) {
 }
 
 function requestLogger(req, res, next) {
-  console.log(`${new Date().toISOString()} ${req.method} ${req.originalUrl}`)
+  console.log(`${new Date().toISOString()} ${req.method} ${redactSensitiveQuery(req.originalUrl)}`)
   next()
+}
+
+function redactSensitiveQuery(url) {
+  return url.replace(/([?&]api_key=)[^&]*/gi, '$1***')
 }
 
 function checkApiKey(req, res, next) {
@@ -327,6 +351,8 @@ async function start() {
   }
 
   if (BOT_MODE === 'polling') {
+    await bot.deleteWebHook()
+    await bot.startPolling()
     console.log('Telegram polling started')
   }
 
@@ -338,20 +364,32 @@ async function start() {
     console.log(`Bot_API server started on http://localhost:${PORT}`)
   })
 
-  process.on('SIGINT', () => shutdown(server, 'SIGINT'))
-  process.on('SIGTERM', () => shutdown(server, 'SIGTERM'))
+  process.once('SIGINT', () => shutdown(server, 'SIGINT'))
+  process.once('SIGTERM', () => shutdown(server, 'SIGTERM'))
 }
 
 function shutdown(server, signal) {
   console.log(`${signal} received, shutting down`)
 
-  server.close(async () => {
+  const forceExitTimer = setTimeout(() => {
+    console.error('Forced shutdown after timeout')
+    process.exit(1)
+  }, 10000)
+
+  forceExitTimer.unref()
+
+  server.close(async (error) => {
+    if (error) {
+      console.error('Failed to close HTTP server:', error.message)
+    }
+
     if (BOT_MODE === 'polling') {
       await bot.stopPolling().catch((error) => {
         console.error('Failed to stop polling:', error.message)
       })
     }
 
+    clearTimeout(forceExitTimer)
     process.exit(0)
   })
 }

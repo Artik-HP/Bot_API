@@ -1,18 +1,18 @@
 # Bot_API
 
-Bot_API — это HTTP-шлюз к Telegram Bot API и одновременно обычный Telegram-бот.
+Bot_API — это HTTP-шлюз к Telegram Bot API и одновременно простой Telegram-бот.
 
-Сервер принимает защищённые HTTP-запросы, пересылает их в Telegram Bot API и возвращает ответ Telegram почти без изменений. Дополнительно бот может работать в режиме `polling` или `webhook` и отвечать на сообщения в Telegram.
+Сервер принимает защищённые API-ключом HTTP-запросы, пересылает их в Telegram Bot API и возвращает ответ Telegram почти без изменений. Для публичного webhook нужен HTTPS-адрес, но TLS обычно должен завершаться на платформе деплоя или reverse proxy, а сам Node.js-сервер слушает обычный HTTP-порт.
 
 ## Возможности
 
-- Универсальный маршрут `POST /bot/:method` для любого метода Telegram Bot API
-- Алиас `POST /api/:method`
-- Старые удобные маршруты `/getMe`, `/sendMessage`, `/sendPhoto`, `/setCommands`
+- Универсальный маршрут `/bot/:method` для любого метода Telegram Bot API
+- Алиас `/api/:method`
+- Удобные маршруты `/getMe`, `/sendMessage`, `/sendPhoto`, `/setCommands`, `/sendDocument`, `/sendSticker`, `/deleteMessage`, `/banUser`, `/unbanUser`, `/getUpdates`, `/getChat/:chatId`
 - Авторизация через `x-api-key`, `Authorization: Bearer ...` или `api_key`
 - Режимы `polling`, `webhook` и `off`
 - Проверка здоровья сервера через `/health`
-- Единые JSON-ошибки и безопасный `.env.example`
+- JSON-ошибки и ограничение размера body через `REQUEST_BODY_LIMIT`
 
 ## Установка
 
@@ -26,7 +26,7 @@ pnpm install
 copy .env.example .env
 ```
 
-Заполни:
+Минимальные настройки:
 
 ```env
 BOT_TOKEN=your_telegram_bot_token
@@ -53,7 +53,27 @@ pnpm dev
 pnpm check
 ```
 
+## Режимы работы
+
+`BOT_MODE=polling` — бот получает updates через long polling и отвечает в Telegram.
+
+`BOT_MODE=webhook` — бот принимает updates на `POST /telegram/webhook`. В `.env` нужно указать публичный HTTPS URL:
+
+```env
+BOT_MODE=webhook
+WEBHOOK_URL=https://your-domain.example/telegram/webhook
+WEBHOOK_SECRET=long_random_secret
+```
+
+`BOT_MODE=off` — сервер отдаёт HTTP API, но не получает входящие сообщения от Telegram. Удобно для локальных smoke-тестов.
+
 ## Примеры запросов
+
+Проверить сервер:
+
+```bash
+curl http://localhost:3000/health
+```
 
 Получить информацию о боте:
 
@@ -61,7 +81,7 @@ pnpm check
 curl -H "x-api-key: your_private_api_key" http://localhost:3000/getMe
 ```
 
-Отправить сообщение:
+Отправить сообщение через универсальный API:
 
 ```bash
 curl -X POST http://localhost:3000/bot/sendMessage ^
@@ -84,7 +104,7 @@ curl -X POST http://localhost:3000/bot/sendPhoto ^
 ```bash
 curl -X POST http://localhost:3000/setCommands ^
   -H "content-type: application/json" ^
-  -H "x-api-key: your_private_api_key" ^
+  -H "x-api-key: api_1zx" ^
   -d "{\"commands\":[{\"command\":\"start\",\"description\":\"Start bot\"}]}"
 ```
 
@@ -97,7 +117,7 @@ POST /bot/<TelegramMethod>
 POST /api/<TelegramMethod>
 ```
 
-Тело запроса — JSON с параметрами метода.
+Для `GET`-запросов параметры берутся из query string. Для `POST`-запросов параметры можно передавать в JSON body и query string; `api_key` из query не пересылается в Telegram.
 
 Пример:
 
@@ -108,28 +128,15 @@ curl -X POST http://localhost:3000/bot/sendMessage ^
   -d "{\"chat_id\":\"123456789\",\"text\":\"Works\"}"
 ```
 
-## Webhook-режим
+## Telegram-бот
 
-Для webhook укажи публичный адрес:
+В режимах `polling` и `webhook` бот также обрабатывает входящие сообщения:
 
-```env
-BOT_MODE=webhook
-WEBHOOK_URL=https://bot-api-hfsn.onrender.com/telegram/webhook
-WEBHOOK_SECRET=long_random_secret
-```
+- `/start` — отправляет приветствие
+- любой другой текст — отвечает эхом
 
-При старте сервер сам вызовет `setWebhook`. Telegram будет отправлять обновления на:
+## TLS и сертификаты
 
-```text
-POST /telegram/webhook
-```
+Node.js-сервер слушает HTTP. Для публичного webhook используй HTTPS на стороне платформы деплоя, nginx, Caddy, Cloudflare Tunnel, Render или другого proxy.
 
-## Локальный API-only режим
-
-Для smoke-тестов без polling:
-
-```env
-BOT_MODE=off
-```
-
-В этом режиме сервер отдаёт HTTP API, но не принимает входящие сообщения от Telegram.
+Локальные `key.pem` и `cert.pem` не нужны для запуска этого приложения и добавлены в `.gitignore`, чтобы приватные ключи не попали в репозиторий.
