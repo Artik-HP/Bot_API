@@ -1,30 +1,143 @@
 require('dotenv').config()
 
+const crypto = require('crypto')
 const express = require('express')
 const TelegramBot = require('node-telegram-bot-api')
 
 const app = express()
-app.use(express.json())
 
-const PORT = process.env.PORT || 3000
-const TOKEN = process.env.BOT_TOKEN
-const API_KEY = process.env.API_KEY || '12345'
+const PORT = Number(process.env.PORT || 3000)
+const BOT_TOKEN = requireEnv('BOT_TOKEN')
+const API_KEY = requireEnv('API_KEY')
+const BOT_MODE = (process.env.BOT_MODE || 'polling').toLowerCase()
+const WEBHOOK_URL = process.env.WEBHOOK_URL || ''
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || ''
+const TELEGRAM_API_BASE_URL = (process.env.TELEGRAM_API_BASE_URL || 'https://api.telegram.org').replace(/\/+$/, '')
+const REQUEST_BODY_LIMIT = process.env.REQUEST_BODY_LIMIT || '5mb'
+const TELEGRAM_METHOD_RE = /^[A-Za-z][A-Za-z0-9_]*$/
 
-if (!TOKEN) {
-  console.error('BOT_TOKEN is missing in .env')
-  process.exit(1)
+if (!['polling', 'webhook', 'off'].includes(BOT_MODE)) {
+  throw new Error('BOT_MODE must be one of: polling, webhook, off')
 }
 
-const bot = new TelegramBot(TOKEN, {
-  polling: true
+if (BOT_MODE === 'webhook' && !WEBHOOK_URL) {
+  throw new Error('WEBHOOK_URL is required when BOT_MODE=webhook')
+}
+
+const bot = new TelegramBot(BOT_TOKEN, {
+  polling: BOT_MODE === 'polling'
 })
 
-console.log('Bot started')
+app.use(express.json({ limit: REQUEST_BODY_LIMIT }))
+app.use(requestLogger)
+
+setupBotHandlers(bot)
+
+app.get('/', (req, res) => {
+  res.json({
+    ok: true,
+    name: 'Bot_API',
+    message: 'HTTP gateway for Telegram Bot API',
+    mode: BOT_MODE,
+    routes: {
+      health: '/health',
+      telegram: '/bot/:method',
+      alias: '/api/:method'
+    }
+  })
+})
+
+app.get('/health', (req, res) => {
+  res.json({
+    ok: true,
+    status: 'healthy',
+    mode: BOT_MODE,
+    uptime: process.uptime()
+  })
+})
+
+app.post('/telegram/webhook', (req, res, next) => {
+  try {
+    if (BOT_MODE !== 'webhook') {
+      return res.status(404).json({
+        ok: false,
+        error: 'Webhook receiver is disabled'
+      })
+    }
+
+    if (WEBHOOK_SECRET && req.get('x-telegram-bot-api-secret-token') !== WEBHOOK_SECRET) {
+      return res.status(401).json({
+        ok: false,
+        error: 'Invalid Telegram webhook secret'
+      })
+    }
+
+    bot.processUpdate(req.body)
+    res.sendStatus(200)
+  } catch (error) {
+    next(error)
+  }
+})
+
+app.all('/bot/:method', checkApiKey, telegramMethodHandler)
+app.all('/api/:method', checkApiKey, telegramMethodHandler)
+
+app.get('/getMe', checkApiKey, legacyTelegramMethod('getMe'))
+app.post('/sendMessage', checkApiKey, legacyTelegramMethod('sendMessage', ['chat_id', 'text']))
+app.post('/sendPhoto', checkApiKey, legacyTelegramMethod('sendPhoto', ['chat_id', 'photo']))
+app.post('/setCommands', checkApiKey, legacyTelegramMethod('setMyCommands', ['commands']))
+
+app.use((req, res) => {
+  res.status(404).json({
+    ok: false,
+    error: 'Route not found'
+  })
+})
+
+app.use((error, req, res, next) => {
+  if (res.headersSent) {
+    return next(error)
+  }
+
+  if (error.type === 'entity.parse.failed') {
+    return res.status(400).json({
+      ok: false,
+      error: 'Invalid JSON body'
+    })
+  }
+
+  const statusCode = error.statusCode || 500
+
+  res.status(statusCode).json({
+    ok: false,
+    error: error.message || 'Internal server error'
+  })
+})
+
+start().catch((error) => {
+  console.error('Startup error:', error.message)
+  process.exit(1)
+})
+
+function requireEnv(name) {
+  const value = process.env[name]
+
+  if (!value) {
+    throw new Error(`${name} is missing in .env`)
+  }
+
+  return value
+}
+
+function requestLogger(req, res, next) {
+  console.log(`${new Date().toISOString()} ${req.method} ${req.originalUrl}`)
+  next()
+}
 
 function checkApiKey(req, res, next) {
-  const key = req.headers['x-api-key'] || req.query.api_key
+  const key = getRequestApiKey(req)
 
-  if (key !== API_KEY) {
+  if (!safeEquals(key, API_KEY)) {
     return res.status(401).json({
       ok: false,
       error: 'Unauthorized'
@@ -34,127 +147,211 @@ function checkApiKey(req, res, next) {
   next()
 }
 
-bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(msg.chat.id, 'Привет. Я API_BOT и я подключён к Telegram Bot API.')
-})
+function getRequestApiKey(req) {
+  const authorization = req.get('authorization') || ''
+  const bearerMatch = authorization.match(/^Bearer\s+(.+)$/i)
 
-bot.on('message', (msg) => {
-  console.log('chat_id:', msg.chat.id)
+  return req.get('x-api-key') || (bearerMatch && bearerMatch[1]) || normalizeQueryValue(req.query.api_key)
+}
 
-  if (!msg.text || msg.text === '/start') return
+function safeEquals(candidate, expected) {
+  if (!candidate || !expected) {
+    return false
+  }
 
-  bot.sendMessage(msg.chat.id, `Ты написал: ${msg.text}`)
-})
+  const candidateBuffer = Buffer.from(String(candidate))
+  const expectedBuffer = Buffer.from(String(expected))
 
-bot.on('polling_error', (error) => {
-  console.error('Polling error:', error.message)
-})
+  return candidateBuffer.length === expectedBuffer.length && crypto.timingSafeEqual(candidateBuffer, expectedBuffer)
+}
 
-app.get('/', (req, res) => {
-  res.json({
-    ok: true,
-    message: 'API_BOT is alive'
+function telegramMethodHandler(req, res, next) {
+  Promise.resolve()
+    .then(async () => {
+      const method = validateTelegramMethod(req.params.method)
+      const payload = getPayload(req)
+      const telegramResponse = await callTelegram(method, payload)
+
+      res.status(telegramResponse.status).json(telegramResponse.body)
+    })
+    .catch(next)
+}
+
+function legacyTelegramMethod(method, requiredFields = []) {
+  return (req, res, next) => {
+    Promise.resolve()
+      .then(async () => {
+        const payload = getPayload(req)
+        requireFields(payload, requiredFields)
+        const telegramResponse = await callTelegram(method, payload)
+
+        res.status(telegramResponse.status).json(telegramResponse.body)
+      })
+      .catch(next)
+  }
+}
+
+function validateTelegramMethod(method) {
+  if (!TELEGRAM_METHOD_RE.test(method)) {
+    const error = new Error('Invalid Telegram Bot API method name')
+    error.statusCode = 400
+    throw error
+  }
+
+  return method
+}
+
+function getPayload(req) {
+  const queryPayload = cleanQuery(req.query)
+
+  if (req.method === 'GET') {
+    return queryPayload
+  }
+
+  if (req.body && (typeof req.body !== 'object' || Array.isArray(req.body))) {
+    const error = new Error('JSON body must be an object')
+    error.statusCode = 400
+    throw error
+  }
+
+  return {
+    ...queryPayload,
+    ...(req.body || {})
+  }
+}
+
+function cleanQuery(query) {
+  return Object.entries(query).reduce((payload, [key, value]) => {
+    if (key !== 'api_key') {
+      payload[key] = normalizeQueryValue(value)
+    }
+
+    return payload
+  }, {})
+}
+
+function normalizeQueryValue(value) {
+  if (Array.isArray(value)) {
+    return value[value.length - 1]
+  }
+
+  return value
+}
+
+function requireFields(payload, fields) {
+  const missingFields = fields.filter((field) => {
+    const value = payload[field]
+    return value === undefined || value === null || value === ''
   })
-})
 
-app.get('/getMe', checkApiKey, async (req, res) => {
-  try {
-    const result = await bot.getMe()
-    res.json({ ok: true, result })
-  } catch (error) {
-    res.status(500).json({ ok: false, error: error.message })
+  if (missingFields.length > 0) {
+    const error = new Error(`${missingFields.join(', ')} required`)
+    error.statusCode = 400
+    throw error
   }
-})
+}
 
-app.post('/sendMessage', checkApiKey, async (req, res) => {
-  try {
-    const { chat_id, text } = req.body
-
-    if (!chat_id || !text) {
-      return res.status(400).json({
-        ok: false,
-        error: 'chat_id and text are required'
-      })
-    }
-
-    const result = await bot.sendMessage(chat_id, text)
-
-    res.json({
-      ok: true,
-      result
-    })
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.message
-    })
-  }
-})
-
-app.post('/setCommands', checkApiKey, async (req, res) => {
-  try {
-    const { commands } = req.body
-
-    if (!Array.isArray(commands)) {
-      return res.status(400).json({
-        ok: false,
-        error: 'commands must be an array'
-      })
-    }
-
-    const result = await bot.setMyCommands(commands)
-
-    res.json({
-      ok: true,
-      result
-    })
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.message
-    })
-  }
-})
-
-app.post('/sendPhoto', checkApiKey, async (req, res) => {
-  try {
-    const { chat_id, photo, caption } = req.body
-
-    if (!chat_id || !photo) {
-      return res.status(400).json({
-        ok: false,
-        error: 'chat_id and photo are required'
-      })
-    }
-
-    const result = await bot.sendPhoto(chat_id, photo, {
-      caption
-    })
-
-    res.json({
-      ok: true,
-      result
-    })
-  } catch (error) {
-    res.status(500).json({
-      ok: false,
-      error: error.message
-    })
-  }
-})
-
-app.listen(PORT, () => {
-  console.log(`API server started on http://localhost:${PORT}`)
-})
-app.use((req, res, next) => {
-  console.log(`${req.method} ${req.url}`)
-  next()
-})
-
-app.get('/health', (req, res) => {
-  res.json({
-    ok: true,
-    status: 'healthy',
-    uptime: process.uptime()
+async function callTelegram(method, payload) {
+  const response = await fetch(`${TELEGRAM_API_BASE_URL}/bot${BOT_TOKEN}/${method}`, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify(payload || {})
   })
-})
+
+  const body = await parseTelegramResponse(response)
+
+  return {
+    status: response.ok ? 200 : response.status,
+    body
+  }
+}
+
+async function parseTelegramResponse(response) {
+  const text = await response.text()
+
+  if (!text) {
+    return {
+      ok: response.ok
+    }
+  }
+
+  try {
+    return JSON.parse(text)
+  } catch (error) {
+    return {
+      ok: false,
+      description: text
+    }
+  }
+}
+
+function setupBotHandlers(botInstance) {
+  botInstance.onText(/^\/start$/, async (msg) => {
+    try {
+      await botInstance.sendMessage(msg.chat.id, 'Привет. Я Bot_API и принимаю команды через Telegram Bot API.')
+    } catch (error) {
+      console.error('Failed to send start message:', error.message)
+    }
+  })
+
+  botInstance.on('message', async (msg) => {
+    if (!msg.text || msg.text === '/start') {
+      return
+    }
+
+    console.log('chat_id:', msg.chat.id)
+
+    try {
+      await botInstance.sendMessage(msg.chat.id, `Ты написал: ${msg.text}`)
+    } catch (error) {
+      console.error('Failed to echo message:', error.message)
+    }
+  })
+
+  botInstance.on('polling_error', (error) => {
+    console.error('Polling error:', error.message)
+  })
+
+  botInstance.on('webhook_error', (error) => {
+    console.error('Webhook error:', error.message)
+  })
+}
+
+async function start() {
+  if (BOT_MODE === 'webhook') {
+    const webhookOptions = WEBHOOK_SECRET ? { secret_token: WEBHOOK_SECRET } : {}
+    await bot.setWebHook(WEBHOOK_URL, webhookOptions)
+    console.log('Telegram webhook configured')
+  }
+
+  if (BOT_MODE === 'polling') {
+    console.log('Telegram polling started')
+  }
+
+  if (BOT_MODE === 'off') {
+    console.log('Telegram update receiver disabled')
+  }
+
+  const server = app.listen(PORT, () => {
+    console.log(`Bot_API server started on http://localhost:${PORT}`)
+  })
+
+  process.on('SIGINT', () => shutdown(server, 'SIGINT'))
+  process.on('SIGTERM', () => shutdown(server, 'SIGTERM'))
+}
+
+function shutdown(server, signal) {
+  console.log(`${signal} received, shutting down`)
+
+  server.close(async () => {
+    if (BOT_MODE === 'polling') {
+      await bot.stopPolling().catch((error) => {
+        console.error('Failed to stop polling:', error.message)
+      })
+    }
+
+    process.exit(0)
+  })
+}
