@@ -114,7 +114,7 @@ curl -X POST http://localhost:3000/bot/sendMessage ^
 
 ```env
 BOT_MODE=webhook
-WEBHOOK_URL=https://your-domain.com/telegram/webhook
+WEBHOOK_URL=https://bot-api-hfsn.onrender.com/telegram/webhook
 WEBHOOK_SECRET=long_random_secret
 ```
 
