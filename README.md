@@ -34,6 +34,7 @@ API_KEY=your_private_api_key
 OPENROUTER_API_KEY=your_openrouter_api_key
 OPENROUTER_MODEL=openai/gpt-4o-mini
 OPENROUTER_PROVIDER=openai
+OPENROUTER_TRANSCRIPTION_MODEL=openai/gpt-4o-mini-transcribe
 PORT=3000
 BOT_MODE=polling
 ```
@@ -105,9 +106,9 @@ curl -X POST http://localhost:3000/bot/sendPhoto ^
 Установить команды:
 
 ```bash
-curl -X POST http://localhost:3000/setCommands ^
+curl.exe -X POST http://localhost:3000/setCommands ^
   -H "content-type: application/json" ^
-  -H "x-api-key: api_1zx" ^
+  -H "x-api-key: api_1zx94an7j8I9o0plll" ^
   -d "{\"commands\":[{\"command\":\"start\",\"description\":\"Start bot\"}]}"
 ```
 
@@ -141,8 +142,67 @@ curl -X POST http://localhost:3000/bot/sendMessage ^
 
 По умолчанию используется `openai/gpt-4o-mini` с маршрутизацией к провайдеру `openai`. Модель можно поменять через `OPENROUTER_MODEL`, провайдера — через `OPENROUTER_PROVIDER`, а промпт характера — через `BOT_PERSONA_PROMPT`.
 
+## Аудиосообщения
+
+Telegram-бот принимает голосовые сообщения и аудиофайлы. Он скачивает файл из Telegram, распознаёт речь через OpenRouter STT и передаёт полученный текст существующей чат-модели.
+
+По умолчанию используется модель распознавания `openai/gpt-4o-mini-transcribe`. Модель и ограничения можно изменить в `.env`:
+
+```env
+OPENROUTER_TRANSCRIPTION_MODEL=openai/gpt-4o-mini-transcribe
+OPENROUTER_TRANSCRIPTION_TIMEOUT_MS=60000
+TELEGRAM_AUDIO_MAX_BYTES=20971520
+TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS=60000
+```
+
 ## TLS и сертификаты
 
 Node.js-сервер слушает HTTP. Для публичного webhook используй HTTPS на стороне платформы деплоя, nginx, Caddy, Cloudflare Tunnel, Render или другого proxy.
 
 Локальные `key.pem` и `cert.pem` не нужны для запуска этого приложения и добавлены в `.gitignore`, чтобы приватные ключи не попали в репозиторий.
+
+## Общение между ботами
+
+Telegram не передаёт сообщения ботов другим ботам через обычные updates чата. Поэтому приложение поддерживает отдельный защищённый HTTP-протокол для общения совместимых экземпляров.
+
+Настрой текущий экземпляр и разрешённых peer-ботов:
+
+```env
+BOT_NAME=main
+BOT_PEERS_JSON={"helper":{"url":"https://helper-bot.example.com","apiKey":"helper_private_api_key"}}
+BOT_TO_BOT_REQUEST_TIMEOUT_MS=60000
+BOT_TO_BOT_MAX_HOPS=3
+BOT_TO_BOT_MAX_TEXT_LENGTH=10000
+```
+
+Принять сообщение от другого бота:
+
+```bash
+curl.exe -X POST http://localhost:3000/bots/messages ^
+  -H "content-type: application/json" ^
+  -H "x-api-key: api_1zx94an7j8I9o0plllm" ^
+  -d "{\"sender\":\"helper\",\"conversation_id\":\"demo-1\",\"text\":\"Hello\"}"
+``
+$body = @{
+    sender = "@artik_ai_helper_bot"
+    conversation_id = "demo-1"
+    text = "Hello"
+} | ConvertTo-Json
+
+Invoke-RestMethod `
+  -Uri "http://localhost:3000/bots/messages" `
+  -Method POST `
+  -Headers @{ "x-api-key" = "api_1zx94an7j8I9o0plllm" } `
+  -ContentType "application/json" `
+  -Body $body`
+
+Отправить сообщение разрешённому peer-боту:
+
+```bash
+curl -X POST http://localhost:3000/bots/helper/messages ^
+  -H "content-type: application/json" ^
+  -H "x-api-key: your_private_api_key" ^
+  -d "{\"conversation_id\":\"demo-1\",\"text\":\"Hello from main\"}"
+```
+
+Список доступных peer-ботов возвращает `GET /bots`. Из Telegram можно использовать команды `/bots` и `/askbot <имя> <сообщение>`.

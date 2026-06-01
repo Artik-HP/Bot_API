@@ -15,10 +15,21 @@ const OPENROUTER_PROVIDER = process.env.OPENROUTER_PROVIDER || 'openai'
 const OPENROUTER_API_BASE_URL = (process.env.OPENROUTER_API_BASE_URL || 'https://openrouter.ai/api/v1').replace(/\/+$/, '')
 const OPENROUTER_MAX_OUTPUT_TOKENS = parsePositiveInteger('OPENROUTER_MAX_OUTPUT_TOKENS', 700)
 const OPENROUTER_REQUEST_TIMEOUT_MS = parsePositiveInteger('OPENROUTER_REQUEST_TIMEOUT_MS', 60000)
+const OPENROUTER_TRANSCRIPTION_MODEL = process.env.OPENROUTER_TRANSCRIPTION_MODEL || 'openai/gpt-4o-mini-transcribe'
+const OPENROUTER_TRANSCRIPTION_TIMEOUT_MS = parsePositiveInteger('OPENROUTER_TRANSCRIPTION_TIMEOUT_MS', 60000)
+const BOT_PEER_NAME_RE = /^[A-Za-z0-9_-]+$/
+const BOT_NAME = parseBotName(process.env.BOT_NAME || 'Bot_API')
+const BOT_PEERS = parseBotPeers(process.env.BOT_PEERS_JSON || '{}')
+const BOT_TO_BOT_REQUEST_TIMEOUT_MS = parsePositiveInteger('BOT_TO_BOT_REQUEST_TIMEOUT_MS', 60000)
+const BOT_TO_BOT_MAX_HOPS = parsePositiveInteger('BOT_TO_BOT_MAX_HOPS', 3)
+const BOT_TO_BOT_MAX_TEXT_LENGTH = parsePositiveInteger('BOT_TO_BOT_MAX_TEXT_LENGTH', 10000)
+const TELEGRAM_REPLY_DELAY_MS = parseNonNegativeInteger('TELEGRAM_REPLY_DELAY_MS', 15000)
 const BOT_MODE = (process.env.BOT_MODE || 'polling').toLowerCase()
 const WEBHOOK_URL = process.env.WEBHOOK_URL || ''
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || ''
 const TELEGRAM_API_BASE_URL = (process.env.TELEGRAM_API_BASE_URL || 'https://api.telegram.org').replace(/\/+$/, '')
+const TELEGRAM_AUDIO_MAX_BYTES = parsePositiveInteger('TELEGRAM_AUDIO_MAX_BYTES', 20 * 1024 * 1024)
+const TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS = parsePositiveInteger('TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS', 60000)
 const REQUEST_BODY_LIMIT = process.env.REQUEST_BODY_LIMIT || '5mb'
 const TELEGRAM_METHOD_RE = /^[A-Za-z][A-Za-z0-9_]*$/
 const TELEGRAM_MESSAGE_LIMIT = 4000
@@ -45,7 +56,8 @@ if (BOT_MODE === 'webhook' && !WEBHOOK_URL) {
 }
 
 const bot = new TelegramBot(BOT_TOKEN, {
-  polling: false
+  polling: false,
+  baseApiUrl: TELEGRAM_API_BASE_URL
 })
 
 app.use(express.json({ limit: REQUEST_BODY_LIMIT }))
@@ -56,13 +68,16 @@ setupBotHandlers(bot)
 app.get('/', (req, res) => {
   res.json({
     ok: true,
-    name: 'Bot_API',
+    name: BOT_NAME,
     message: 'HTTP gateway for Telegram Bot API',
     mode: BOT_MODE,
     routes: {
       health: '/health',
       telegram: '/bot/:method',
-      alias: '/api/:method'
+      alias: '/api/:method',
+      receiveBotMessage: '/bots/messages',
+      sendBotMessage: '/bots/:peer/messages',
+      peers: '/bots'
     }
   })
 })
@@ -101,6 +116,9 @@ app.post('/telegram/webhook', (req, res, next) => {
 
 app.all('/bot/:method', checkApiKey, telegramMethodHandler)
 app.all('/api/:method', checkApiKey, telegramMethodHandler)
+app.get('/bots', checkApiKey, listBotPeers)
+app.post('/bots/messages', checkApiKey, receiveBotMessage)
+app.post('/bots/:peer/messages', checkApiKey, sendBotMessageToPeer)
 
 app.get('/getMe', checkApiKey, legacyTelegramMethod('getMe'))
 app.post('/sendMessage', checkApiKey, legacyTelegramMethod('sendMessage', ['chat_id', 'text']))
@@ -175,6 +193,78 @@ function parsePositiveInteger(name, fallback) {
   }
 
   return value
+}
+
+function parseNonNegativeInteger(name, fallback) {
+  const value = Number(process.env[name] || fallback)
+
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative integer`)
+  }
+
+  return value
+}
+
+function parseBotPeers(value) {
+  let peers
+
+  try {
+    peers = JSON.parse(value)
+  } catch (error) {
+    throw new Error('BOT_PEERS_JSON must be valid JSON')
+  }
+
+  if (!peers || typeof peers !== 'object' || Array.isArray(peers)) {
+    throw new Error('BOT_PEERS_JSON must be an object')
+  }
+
+  return new Map(Object.entries(peers).map(([name, peer]) => {
+    if (!BOT_PEER_NAME_RE.test(name) || name.length > 64) {
+      throw new Error(`Invalid peer bot name: ${name}`)
+    }
+
+    if (!peer || typeof peer !== 'object' || Array.isArray(peer)) {
+      throw new Error(`Peer bot ${name} must be an object`)
+    }
+
+    return [name, {
+      url: normalizePeerBotUrl(name, peer.url),
+      apiKey: requirePeerBotValue(name, 'apiKey', peer.apiKey)
+    }]
+  }))
+}
+
+function parseBotName(value) {
+  if (!BOT_PEER_NAME_RE.test(value) || value.length > 64) {
+    throw new Error('BOT_NAME must contain up to 64 letters, numbers, underscores and hyphens')
+  }
+
+  return value
+}
+
+function normalizePeerBotUrl(name, value) {
+  const peerUrl = requirePeerBotValue(name, 'url', value)
+  let url
+
+  try {
+    url = new URL(peerUrl)
+  } catch (error) {
+    throw new Error(`Peer bot ${name} has an invalid url`)
+  }
+
+  if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) {
+    throw new Error(`Peer bot ${name} url must be an HTTP(S) base URL without credentials, query or hash`)
+  }
+
+  return url.toString().replace(/\/+$/, '')
+}
+
+function requirePeerBotValue(name, field, value) {
+  if (typeof value !== 'string' || !value.trim()) {
+    throw new Error(`Peer bot ${name} is missing ${field}`)
+  }
+
+  return value.trim()
 }
 
 function requestLogger(req, res, next) {
@@ -303,6 +393,197 @@ function requireFields(payload, fields) {
   }
 }
 
+function listBotPeers(req, res) {
+  res.json({
+    ok: true,
+    bot: BOT_NAME,
+    peers: [...BOT_PEERS.keys()]
+  })
+}
+
+function receiveBotMessage(req, res, next) {
+  Promise.resolve()
+    .then(async () => {
+      const payload = getPayload(req)
+      requireFields(payload, ['text'])
+
+      const text = normalizeBotText(payload.text)
+      const sender = normalizeBotSender(payload.sender)
+      const conversationId = normalizeBotConversationId(payload.conversation_id)
+      const hops = normalizeBotHops(payload.hops)
+
+      assertBotHopLimit(hops)
+
+      const reply = await enqueueBotReply(
+        createBotConversationKey(sender, conversationId),
+        `[Message from bot "${sender}"]\n${text}`
+      )
+
+      res.json({
+        ok: true,
+        bot: BOT_NAME,
+        conversation_id: conversationId,
+        hops,
+        reply
+      })
+    })
+    .catch(next)
+}
+
+function sendBotMessageToPeer(req, res, next) {
+  Promise.resolve()
+    .then(async () => {
+      const payload = getPayload(req)
+      requireFields(payload, ['text'])
+
+      const response = await callPeerBot(req.params.peer, {
+        text: normalizeBotText(payload.text),
+        conversation_id: normalizeBotConversationId(payload.conversation_id),
+        hops: normalizeBotHops(payload.hops)
+      })
+
+      res.json({
+        ok: true,
+        peer: req.params.peer,
+        ...response
+      })
+    })
+    .catch(next)
+}
+
+function normalizeBotText(value) {
+  if (typeof value !== 'string' || !value.trim()) {
+    throw createHttpError(400, 'text must be a non-empty string')
+  }
+
+  const text = value.trim()
+
+  if (text.length > BOT_TO_BOT_MAX_TEXT_LENGTH) {
+    throw createHttpError(400, `text must not exceed ${BOT_TO_BOT_MAX_TEXT_LENGTH} characters`)
+  }
+
+  return text
+}
+
+function normalizeBotSender(value) {
+  if (value === undefined || value === null || value === '') {
+    return 'anonymous-bot'
+  }
+
+  if (typeof value !== 'string' || !BOT_PEER_NAME_RE.test(value) || value.length > 64) {
+    throw createHttpError(400, 'sender must contain up to 64 letters, numbers, underscores and hyphens')
+  }
+
+  return value
+}
+
+function normalizeBotConversationId(value) {
+  if (value === undefined || value === null || value === '') {
+    return crypto.randomUUID()
+  }
+
+  if (typeof value !== 'string' || value.length > 128) {
+    throw createHttpError(400, 'conversation_id must be a string of up to 128 characters')
+  }
+
+  return value
+}
+
+function normalizeBotHops(value) {
+  if (value === undefined || value === null || value === '') {
+    return 0
+  }
+
+  const hops = Number(value)
+
+  if (!Number.isInteger(hops) || hops < 0) {
+    throw createHttpError(400, 'hops must be a non-negative integer')
+  }
+
+  return hops
+}
+
+function assertBotHopLimit(hops) {
+  if (hops > BOT_TO_BOT_MAX_HOPS) {
+    throw createHttpError(508, `Bot message exceeded the maximum hop count of ${BOT_TO_BOT_MAX_HOPS}`)
+  }
+}
+
+function createBotConversationKey(sender, conversationId) {
+  return `bot:${sender}:${conversationId}`
+}
+
+function createHttpError(statusCode, message) {
+  const error = new Error(message)
+  error.statusCode = statusCode
+
+  return error
+}
+
+async function callPeerBot(name, payload) {
+  const peer = BOT_PEERS.get(name)
+
+  if (!peer) {
+    throw createHttpError(404, `Unknown peer bot: ${name}`)
+  }
+
+  assertBotHopLimit(payload.hops + 1)
+
+  let response
+
+  try {
+    response = await fetch(`${peer.url}/bots/messages`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json; charset=utf-8',
+        'x-api-key': peer.apiKey
+      },
+      body: JSON.stringify({
+        sender: BOT_NAME,
+        conversation_id: payload.conversation_id,
+        hops: payload.hops + 1,
+        text: payload.text
+      }),
+      signal: AbortSignal.timeout(BOT_TO_BOT_REQUEST_TIMEOUT_MS)
+    })
+  } catch (error) {
+    const statusCode = error.name === 'TimeoutError' || error.name === 'AbortError' ? 504 : 502
+
+    throw createHttpError(statusCode, `Peer bot ${name} request failed: ${error.message}`)
+  }
+
+  const body = await parseBotPeerResponse(response)
+
+  if (!response.ok) {
+    throw createHttpError(502, body?.error || `Peer bot ${name} request failed with status ${response.status}`)
+  }
+
+  if (!body?.ok || typeof body.reply !== 'string' || !body.reply.trim()) {
+    throw createHttpError(502, `Peer bot ${name} returned an invalid response`)
+  }
+
+  return {
+    bot: typeof body.bot === 'string' && body.bot ? body.bot : name,
+    conversation_id: body.conversation_id || payload.conversation_id,
+    hops: body.hops,
+    reply: body.reply.trim()
+  }
+}
+
+async function parseBotPeerResponse(response) {
+  const text = await response.text()
+
+  if (!text) {
+    return {}
+  }
+
+  try {
+    return JSON.parse(text)
+  } catch (error) {
+    throw createHttpError(502, 'Peer bot returned invalid JSON')
+  }
+}
+
 async function callTelegram(method, payload) {
   const response = await fetch(`${TELEGRAM_API_BASE_URL}/bot${BOT_TOKEN}/${method}`, {
     method: 'POST',
@@ -337,6 +618,182 @@ async function parseTelegramResponse(response) {
       description: text
     }
   }
+}
+
+function getTelegramAudio(msg) {
+  if (msg.voice?.file_id) {
+    return {
+      fileId: msg.voice.file_id,
+      fileSize: msg.voice.file_size,
+      format: 'ogg'
+    }
+  }
+
+  if (msg.audio?.file_id) {
+    return {
+      fileId: msg.audio.file_id,
+      fileName: msg.audio.file_name,
+      fileSize: msg.audio.file_size,
+      mimeType: msg.audio.mime_type
+    }
+  }
+
+  return null
+}
+
+async function transcribeTelegramAudio(audio) {
+  assertTelegramAudioSize(audio.fileSize)
+
+  const { buffer, filePath } = await downloadTelegramFile(audio.fileId)
+  const format = audio.format || detectAudioFormat(audio.mimeType, audio.fileName, filePath)
+  const response = await fetch(`${OPENROUTER_API_BASE_URL}/audio/transcriptions`, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${OPENROUTER_API_KEY}`,
+      'content-type': 'application/json; charset=utf-8'
+    },
+    body: JSON.stringify({
+      model: OPENROUTER_TRANSCRIPTION_MODEL,
+      input_audio: {
+        data: buffer.toString('base64'),
+        format
+      }
+    }),
+    signal: AbortSignal.timeout(OPENROUTER_TRANSCRIPTION_TIMEOUT_MS)
+  })
+  const body = await parseOpenRouterResponse(response)
+
+  if (!response.ok) {
+    throw new Error(body.error?.message || `OpenRouter transcription request failed with status ${response.status}`)
+  }
+
+  if (typeof body.text !== 'string' || !body.text.trim()) {
+    throw new Error('OpenRouter transcription returned empty text')
+  }
+
+  return body.text.trim()
+}
+
+async function downloadTelegramFile(fileId) {
+  const telegramResponse = await callTelegram('getFile', {
+    file_id: fileId
+  })
+  const file = telegramResponse.body?.result
+
+  if (telegramResponse.status !== 200 || !telegramResponse.body?.ok || typeof file?.file_path !== 'string') {
+    throw new Error(telegramResponse.body?.description || 'Telegram did not return an audio file path')
+  }
+
+  assertTelegramAudioSize(file.file_size)
+
+  const filePath = file.file_path
+  const encodedFilePath = filePath.split('/').map(encodeURIComponent).join('/')
+  const response = await fetch(`${TELEGRAM_API_BASE_URL}/file/bot${BOT_TOKEN}/${encodedFilePath}`, {
+    signal: AbortSignal.timeout(TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS)
+  })
+
+  if (!response.ok) {
+    throw new Error(`Telegram audio download failed with status ${response.status}`)
+  }
+
+  return {
+    buffer: await readResponseBufferWithLimit(response, TELEGRAM_AUDIO_MAX_BYTES),
+    filePath
+  }
+}
+
+async function readResponseBufferWithLimit(response, maxBytes) {
+  const contentLength = Number(response.headers.get('content-length'))
+
+  if (Number.isFinite(contentLength) && contentLength > maxBytes) {
+    throw new Error(`Audio message exceeds the ${formatMegabytes(maxBytes)} MB limit`)
+  }
+
+  if (!response.body) {
+    throw new Error('Telegram returned an empty audio file')
+  }
+
+  const chunks = []
+  let totalBytes = 0
+
+  for await (const chunk of response.body) {
+    totalBytes += chunk.byteLength
+
+    if (totalBytes > maxBytes) {
+      throw new Error(`Audio message exceeds the ${formatMegabytes(maxBytes)} MB limit`)
+    }
+
+    chunks.push(Buffer.from(chunk))
+  }
+
+  if (totalBytes === 0) {
+    throw new Error('Telegram returned an empty audio file')
+  }
+
+  return Buffer.concat(chunks, totalBytes)
+}
+
+function assertTelegramAudioSize(fileSize) {
+  if (Number.isFinite(fileSize) && fileSize > TELEGRAM_AUDIO_MAX_BYTES) {
+    throw new Error(`Audio message exceeds the ${formatMegabytes(TELEGRAM_AUDIO_MAX_BYTES)} MB limit`)
+  }
+}
+
+function formatMegabytes(bytes) {
+  return Math.round(bytes / 1024 / 1024)
+}
+
+function getAudioTranscriptionFallback(error) {
+  const message = String(error.message || '')
+
+  if (message.startsWith('Audio message exceeds') || message.startsWith('Unsupported audio format')) {
+    return `Не удалось распознать аудиосообщение: ${message}`
+  }
+
+  return 'Не удалось распознать аудиосообщение. Попробуй отправить другой файл или повторить позже.'
+}
+
+function detectAudioFormat(mimeType, fileName, filePath) {
+  const formatByMimeType = {
+    'audio/aac': 'aac',
+    'audio/flac': 'flac',
+    'audio/mp4': 'm4a',
+    'audio/mpeg': 'mp3',
+    'audio/ogg': 'ogg',
+    'audio/wav': 'wav',
+    'audio/webm': 'webm',
+    'audio/x-aac': 'aac',
+    'audio/x-flac': 'flac',
+    'audio/x-m4a': 'm4a',
+    'audio/x-wav': 'wav'
+  }
+  const formatByExtension = {
+    '.aac': 'aac',
+    '.flac': 'flac',
+    '.m4a': 'm4a',
+    '.mp3': 'mp3',
+    '.oga': 'ogg',
+    '.ogg': 'ogg',
+    '.opus': 'ogg',
+    '.wav': 'wav',
+    '.webm': 'webm'
+  }
+  const normalizedMimeType = String(mimeType || '').toLowerCase().split(';')[0]
+
+  if (formatByMimeType[normalizedMimeType]) {
+    return formatByMimeType[normalizedMimeType]
+  }
+
+  for (const name of [fileName, filePath]) {
+    const normalizedName = String(name || '').toLowerCase()
+    const extension = Object.keys(formatByExtension).find((candidate) => normalizedName.endsWith(candidate))
+
+    if (extension) {
+      return formatByExtension[extension]
+    }
+  }
+
+  throw new Error('Unsupported audio format. Send OGG, MP3, M4A, WAV, FLAC, WebM or AAC.')
 }
 
 async function generateBotReply(chatId, text) {
@@ -443,7 +900,7 @@ function getTelegramRetryAfter(error) {
   const retryAfter = Number(error.response?.body?.parameters?.retry_after)
 
   if (Number.isInteger(retryAfter) && retryAfter > 0) {
-    return retryAfter; bot_API_TL_bot
+    return retryAfter
   }
 
   const match = String(error.message || '').match(/retry after (\d+)/i)
@@ -467,11 +924,13 @@ function setupBotHandlers(botInstance) {
 
 botInstance.on('message', async (msg) => {
 
-  if (msg.from?.id === botInstance.options?.polling?.params?.id) {
-  return;
-}
-  
-  if (!msg.text || /^\/start(?:@\w+)?$/.test(msg.text)) {
+  if (msg.from?.is_bot) {
+    return;
+  }
+
+  const audio = getTelegramAudio(msg)
+
+  if ((!msg.text && !audio) || /^\/start(?:@\w+)?$/.test(msg.text)) {
     return;
   }
 
@@ -482,13 +941,62 @@ botInstance.on('message', async (msg) => {
     await botInstance.sendMessage(msg.chat.id, 'Контекст сброшен. Говори.');
     return;
   }
-  await sleep(15000);
- 
+  if (/^\/bots(?:@\w+)?$/.test(msg.text)) {
+    const peers = [...BOT_PEERS.keys()]
+    await botInstance.sendMessage(msg.chat.id, peers.length > 0 ? `Peer bots: ${peers.join(', ')}` : 'No peer bots configured.')
+    return
+  }
+
+  const askBotMatch = msg.text?.match(/^\/askbot(?:@\w+)?(?:\s+(\S+))?(?:\s+([\s\S]+))?$/)
+
+  if (askBotMatch) {
+    const [, peerName, peerMessage] = askBotMatch
+
+    if (!peerName || !peerMessage) {
+      await botInstance.sendMessage(msg.chat.id, 'Usage: /askbot <name> <message>')
+      return
+    }
+
+    try {
+      await botInstance.sendChatAction(msg.chat.id, 'typing').catch(() => {})
+      const response = await callPeerBot(peerName, {
+        text: normalizeBotText(peerMessage),
+        conversation_id: crypto.randomUUID(),
+        hops: 0
+      })
+      await sendLongMessage(botInstance, msg.chat.id, `[${response.bot}]\n${response.reply}`)
+    } catch (error) {
+      console.error('Failed to call peer bot:', error.message)
+      await botInstance.sendMessage(msg.chat.id, `Peer bot did not reply: ${error.message}`)
+    }
+
+    return
+  }
+
+  if (TELEGRAM_REPLY_DELAY_MS > 0) {
+    await wait(TELEGRAM_REPLY_DELAY_MS)
+  }
+
+  let userText = msg.text
+
+  if (audio) {
+    try {
+      await botInstance.sendChatAction(msg.chat.id, 'typing').catch(() => {})
+      userText = await transcribeTelegramAudio(audio)
+    } catch (error) {
+      console.error('Failed to transcribe audio message:', error.message)
+      await sendTelegramMessageWithRetry(botInstance, msg.chat.id, getAudioTranscriptionFallback(error)).catch((sendError) => {
+        console.error('Failed to send transcription fallback reply:', sendError.message)
+      })
+      return
+    }
+  }
+
   let answer
 
   try {
     await botInstance.sendChatAction(msg.chat.id, 'typing').catch(() => {})
-    answer = await enqueueBotReply(chatId, msg.text)
+    answer = await enqueueBotReply(chatId, userText)
   } catch (error) {
     console.error('Failed to generate reply:', error.message)
     await sendTelegramMessageWithRetry(botInstance, msg.chat.id, 'Модель сейчас не отвечает. Попробуй еще раз позже.').catch((sendError) => {
