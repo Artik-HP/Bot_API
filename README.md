@@ -31,6 +31,9 @@ copy .env.example .env
 ```env
 BOT_TOKEN=your_telegram_bot_token
 API_KEY=your_private_api_key
+OPENROUTER_API_KEY=your_openrouter_api_key
+OPENROUTER_MODEL=openai/gpt-4o-mini
+OPENROUTER_PROVIDER=openai
 PORT=3000
 BOT_MODE=polling
 ```
@@ -133,7 +136,10 @@ curl -X POST http://localhost:3000/bot/sendMessage ^
 В режимах `polling` и `webhook` бот также обрабатывает входящие сообщения:
 
 - `/start` — отправляет приветствие
-- любой другой текст — отвечает эхом
+- `/reset` — сбрасывает контекст диалога
+- любой другой текст — отправляет модели через OpenRouter и отвечает с заданным характером
+
+По умолчанию используется `openai/gpt-4o-mini` с маршрутизацией к провайдеру `openai`. Модель можно поменять через `OPENROUTER_MODEL`, провайдера — через `OPENROUTER_PROVIDER`, а промпт характера — через `BOT_PERSONA_PROMPT`.
 
 ## TLS и сертификаты
 
