@@ -23,6 +23,21 @@ const BOT_PEERS = parseBotPeers(process.env.BOT_PEERS_JSON || '{}')
 const BOT_TO_BOT_REQUEST_TIMEOUT_MS = parsePositiveInteger('BOT_TO_BOT_REQUEST_TIMEOUT_MS', 60000)
 const BOT_TO_BOT_MAX_HOPS = parsePositiveInteger('BOT_TO_BOT_MAX_HOPS', 3)
 const BOT_TO_BOT_MAX_TEXT_LENGTH = parsePositiveInteger('BOT_TO_BOT_MAX_TEXT_LENGTH', 10000)
+const TELEGRAM_TARGET_CHAT_ID = normalizeOptionalTelegramChatId(process.env.CHAT_ID || process.env.Chat_id || '')
+const TELEGRAM_BOT_USERNAME = normalizeTelegramUsername(process.env.BOT_USERNAME || '')
+const BOT_TO_BOT_ENABLED = parseBoolean('BOT_TO_BOT_ENABLED', false)
+const BOT_TO_BOT_CHAT_ID = normalizeOptionalTelegramChatId(
+  process.env.BOT_TO_BOT_CHAT_ID || process.env.BOT_TO_BOT_OWNER_CHAT_ID || TELEGRAM_TARGET_CHAT_ID
+)
+const BOT_TO_BOT_PEER_USERNAME = normalizeTelegramUsername(
+  process.env.OTHER_BOT_USERNAME || process.env.BOT_CHAT_PEER_USERNAME || process.env.BOT_PEER_USERNAME || ''
+)
+const BOT_TO_BOT_ALLOWED_BOTS = new Set([
+  ...parseTelegramUsernameList(process.env.BOT_TO_BOT_ALLOW_BOTS || ''),
+  BOT_TO_BOT_PEER_USERNAME
+].filter(Boolean))
+const BOT_TO_BOT_MAX_TURNS = parsePositiveInteger('BOT_TO_BOT_MAX_TURNS', BOT_TO_BOT_MAX_HOPS)
+const BOT_TO_BOT_TURN_WINDOW_MS = parsePositiveInteger('BOT_TO_BOT_TURN_WINDOW_MS', 10 * 60 * 1000)
 const TELEGRAM_REPLY_DELAY_MS = parseNonNegativeInteger('TELEGRAM_REPLY_DELAY_MS', 15000)
 const BOT_MODE = (process.env.BOT_MODE || 'polling').toLowerCase()
 const WEBHOOK_URL = process.env.WEBHOOK_URL || ''
@@ -44,6 +59,7 @@ const BOT_PERSONA_PROMPT = process.env.BOT_PERSONA_PROMPT || [
 ].join(' ')
 const chatHistories = new Map()
 const chatQueues = new Map()
+const botToBotTurnCounts = new Map()
 
 app.disable('x-powered-by')
 
@@ -205,6 +221,24 @@ function parseNonNegativeInteger(name, fallback) {
   return value
 }
 
+function parseBoolean(name, fallback) {
+  const value = process.env[name]
+
+  if (value === undefined || value === null || value === '') {
+    return fallback
+  }
+
+  if (/^(1|true|yes|on)$/i.test(value)) {
+    return true
+  }
+
+  if (/^(0|false|no|off)$/i.test(value)) {
+    return false
+  }
+
+  throw new Error(`${name} must be a boolean`)
+}
+
 function parseBotPeers(value) {
   let peers
 
@@ -240,6 +274,53 @@ function parseBotName(value) {
   }
 
   return value
+}
+
+function normalizeOptionalTelegramChatId(value) {
+  if (value === undefined || value === null || value === '') {
+    return ''
+  }
+
+  const chatId = String(value).trim()
+
+  if (!chatId) {
+    return ''
+  }
+
+  if (!/^-?\d+$/.test(chatId) && !/^@[A-Za-z0-9_]{5,64}$/.test(chatId)) {
+    throw new Error('Telegram chat id must be a numeric id or @username')
+  }
+
+  return chatId
+}
+
+function normalizeTelegramUsername(value) {
+  if (value === undefined || value === null || value === '') {
+    return ''
+  }
+
+  const username = String(value).trim().replace(/^@/, '')
+
+  if (!username) {
+    return ''
+  }
+
+  if (!/^[A-Za-z0-9_]{1,64}$/.test(username)) {
+    throw new Error('Telegram username must contain only letters, numbers and underscores')
+  }
+
+  return username.toLowerCase()
+}
+
+function parseTelegramUsernameList(value) {
+  if (!value || !String(value).trim()) {
+    return []
+  }
+
+  return String(value)
+    .split(/[,\s]+/)
+    .map((username) => normalizeTelegramUsername(username))
+    .filter(Boolean)
 }
 
 function normalizePeerBotUrl(name, value) {
@@ -873,15 +954,23 @@ function enqueueBotReply(chatId, text) {
   })
 }
 
-async function sendLongMessage(botInstance, chatId, text) {
+async function sendLongMessage(botInstance, chatId, text, options = {}) {
+  let isFirstChunk = true
+
   for (let offset = 0; offset < text.length; offset += TELEGRAM_MESSAGE_LIMIT) {
-    await sendTelegramMessageWithRetry(botInstance, chatId, text.slice(offset, offset + TELEGRAM_MESSAGE_LIMIT))
+    await sendTelegramMessageWithRetry(
+      botInstance,
+      chatId,
+      text.slice(offset, offset + TELEGRAM_MESSAGE_LIMIT),
+      isFirstChunk ? options : {}
+    )
+    isFirstChunk = false
   }
 }
 
-async function sendTelegramMessageWithRetry(botInstance, chatId, text) {
+async function sendTelegramMessageWithRetry(botInstance, chatId, text, options = {}) {
   try {
-    return await botInstance.sendMessage(chatId, text)
+    return await botInstance.sendMessage(chatId, text, options)
   } catch (error) {
     const retryAfter = getTelegramRetryAfter(error)
 
@@ -892,7 +981,7 @@ async function sendTelegramMessageWithRetry(botInstance, chatId, text) {
     console.warn(`Telegram rate limit reached, retrying after ${retryAfter} seconds`)
     await wait(retryAfter * 1000)
 
-    return botInstance.sendMessage(chatId, text)
+    return botInstance.sendMessage(chatId, text, options)
   }
 }
 
@@ -912,6 +1001,78 @@ function wait(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds))
 }
 
+function shouldHandleTelegramBotMessage(msg) {
+  if (!msg.from?.is_bot) {
+    return true
+  }
+
+  if (!BOT_TO_BOT_ENABLED || !BOT_TO_BOT_CHAT_ID) {
+    return false
+  }
+
+  if (String(msg.chat?.id) !== BOT_TO_BOT_CHAT_ID) {
+    return false
+  }
+
+  const username = normalizeTelegramUsername(msg.from.username || '')
+
+  if (!username || (TELEGRAM_BOT_USERNAME && username === TELEGRAM_BOT_USERNAME)) {
+    return false
+  }
+
+  if (BOT_TO_BOT_ALLOWED_BOTS.size === 0 || !BOT_TO_BOT_ALLOWED_BOTS.has(username)) {
+    return false
+  }
+
+  return true
+}
+
+function reserveTelegramBotToBotTurn(chatId) {
+  const key = String(chatId)
+  const now = Date.now()
+  const current = botToBotTurnCounts.get(key)
+  const state = current && now - current.updatedAt <= BOT_TO_BOT_TURN_WINDOW_MS
+    ? current
+    : { turns: 0, updatedAt: now }
+
+  if (state.turns >= BOT_TO_BOT_MAX_TURNS) {
+    return false
+  }
+
+  botToBotTurnCounts.set(key, {
+    turns: state.turns + 1,
+    updatedAt: now
+  })
+
+  return true
+}
+
+function resetTelegramBotToBotTurns(chatId) {
+  botToBotTurnCounts.delete(String(chatId))
+}
+
+function createTelegramBotToBotPrompt(username, text) {
+  return [
+    `Telegram-бот @${username} написал в общем чате:`,
+    text,
+    '',
+    `Ответь напрямую боту @${username} от имени ${BOT_NAME}.`
+  ].join('\n')
+}
+
+function formatTelegramBotToBotReply(username, text) {
+  return username ? `@${username} ${text}` : text
+}
+
+function getTelegramBotReplyOptions(msg) {
+  return msg.message_id
+    ? {
+        reply_to_message_id: msg.message_id,
+        allow_sending_without_reply: true
+      }
+    : {}
+}
+
 
 function setupBotHandlers(botInstance) {
   botInstance.onText(/^\/start(?:@\w+)?$/, async (msg) => {
@@ -923,31 +1084,47 @@ function setupBotHandlers(botInstance) {
   })
 
 botInstance.on('message', async (msg) => {
+  const fromBot = Boolean(msg.from?.is_bot)
+  const fromBotUsername = normalizeTelegramUsername(msg.from?.username || '')
 
-  if (msg.from?.is_bot) {
-    return;
+  if (fromBot && !shouldHandleTelegramBotMessage(msg)) {
+    return
   }
 
-  const audio = getTelegramAudio(msg)
-
-  if ((!msg.text && !audio) || /^\/start(?:@\w+)?$/.test(msg.text)) {
-    return;
+  if (fromBot && msg.text?.startsWith('/')) {
+    return
   }
 
-  const chatId = String(msg.chat.id);
+  const audio = fromBot ? null : getTelegramAudio(msg)
 
-  if (/^\/reset(?:@\w+)?$/.test(msg.text)) {
-    chatHistories.delete(chatId);
-    await botInstance.sendMessage(msg.chat.id, 'Контекст сброшен. Говори.');
-    return;
+  if ((!msg.text && !audio) || /^\/start(?:@\w+)?$/.test(msg.text || '')) {
+    return
   }
-  if (/^\/bots(?:@\w+)?$/.test(msg.text)) {
+
+  const chatId = String(msg.chat.id)
+
+  if (fromBot) {
+    if (!reserveTelegramBotToBotTurn(chatId)) {
+      console.warn(`Bot-to-bot turn limit reached in chat ${chatId}`)
+      return
+    }
+  } else {
+    resetTelegramBotToBotTurns(chatId)
+  }
+
+  if (!fromBot && /^\/reset(?:@\w+)?$/.test(msg.text || '')) {
+    chatHistories.delete(chatId)
+    await botInstance.sendMessage(msg.chat.id, 'Контекст сброшен. Говори.')
+    return
+  }
+
+  if (!fromBot && /^\/bots(?:@\w+)?$/.test(msg.text || '')) {
     const peers = [...BOT_PEERS.keys()]
     await botInstance.sendMessage(msg.chat.id, peers.length > 0 ? `Peer bots: ${peers.join(', ')}` : 'No peer bots configured.')
     return
   }
 
-  const askBotMatch = msg.text?.match(/^\/askbot(?:@\w+)?(?:\s+(\S+))?(?:\s+([\s\S]+))?$/)
+  const askBotMatch = fromBot ? null : msg.text?.match(/^\/askbot(?:@\w+)?(?:\s+(\S+))?(?:\s+([\s\S]+))?$/)
 
   if (askBotMatch) {
     const [, peerName, peerMessage] = askBotMatch
@@ -992,6 +1169,10 @@ botInstance.on('message', async (msg) => {
     }
   }
 
+  if (fromBot) {
+    userText = createTelegramBotToBotPrompt(fromBotUsername, userText)
+  }
+
   let answer
 
   try {
@@ -1005,10 +1186,13 @@ botInstance.on('message', async (msg) => {
     return
   }
 
-  await sendLongMessage(botInstance, msg.chat.id, answer).catch((error) => {
+  const replyText = fromBot ? formatTelegramBotToBotReply(fromBotUsername, answer) : answer
+  const replyOptions = fromBot ? getTelegramBotReplyOptions(msg) : {}
+
+  await sendLongMessage(botInstance, msg.chat.id, replyText, replyOptions).catch((error) => {
     console.error('Failed to send generated reply:', error.message)
   })
-});
+})
 
   botInstance.on('polling_error', (error) => {
     console.error('Polling error:', error.message)

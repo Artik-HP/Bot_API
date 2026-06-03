@@ -148,12 +148,12 @@ Telegram-бот принимает голосовые сообщения и ау
 
 По умолчанию используется модель распознавания `openai/gpt-4o-mini-transcribe`. Модель и ограничения можно изменить в `.env`:
 
-```env
+
 OPENROUTER_TRANSCRIPTION_MODEL=openai/gpt-4o-mini-transcribe
 OPENROUTER_TRANSCRIPTION_TIMEOUT_MS=60000
 TELEGRAM_AUDIO_MAX_BYTES=20971520
 TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS=60000
-```
+
 
 ## TLS и сертификаты
 
@@ -187,7 +187,7 @@ $body = @{
     sender = "@artik_ai_helper_bot"
     conversation_id = "demo-1"
     text = "Hello"
-} | ConvertTo-Json
+} | ConvertTo-Jsonnpmm
 
 Invoke-RestMethod `
   -Uri "http://localhost:3000/bots/messages" `
