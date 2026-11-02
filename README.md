@@ -1,208 +1,132 @@
-# Bot_API
+# PulseDesk
 
-Bot_API — это HTTP-шлюз к Telegram Bot API и одновременно простой Telegram-бот.
+**Модульный Telegram-бот для контроля сайтов, API и инцидентов.** Он проверяет доступность, нужный текст на странице и срок SSL-сертификата, сообщает о подтверждённом сбое и восстановлении, сохраняет историю и очередь уведомлений.
 
-Сервер принимает защищённые API-ключом HTTP-запросы, пересылает их в Telegram Bot API и возвращает ответ Telegram почти без изменений. Для публичного webhook нужен HTTPS-адрес, но TLS обычно должен завершаться на платформе деплоя или reverse proxy, а сам Node.js-сервер слушает обычный HTTP-порт.
+Проект создан из Bot_API как новый кейс для существующего портфолио. Архив шлюза сохранён в [`legacy/gateway.cjs`](legacy/gateway.cjs); новый запуск от него не зависит.
 
-## Возможности
+## Попробовать
 
-- Универсальный маршрут `/bot/:method` для любого метода Telegram Bot API
-- Алиас `/api/:method`
-- Удобные маршруты `/getMe`, `/sendMessage`, `/sendPhoto`, `/setCommands`, `/sendDocument`, `/sendSticker`, `/deleteMessage`, `/banUser`, `/unbanUser`, `/getUpdates`, `/getChat/:chatId`
-- Авторизация через `x-api-key`, `Authorization: Bearer ...` или `api_key`
-- Режимы `polling`, `webhook` и `off`
-- Проверка здоровья сервера через `/health`
-- JSON-ошибки и ограничение размера body через `REQUEST_BODY_LIMIT`
+Нужен **Node.js 24.x**. Сторонних runtime-зависимостей нет, используется встроенный SQLite.
 
-## Установка
-
-```bash
-pnpm install
+```powershell
+cd D:\Проекты\API_BOT
+npm run demo
 ```
 
-Создай `.env` по примеру:
+Открой [локальную демонстрацию](http://127.0.0.1:4141).
 
-```bash
-copy .env.example .env
+1. **«Запустить сбой»** — два неудачных тестовых измерения открывают один инцидент; уведомление появляется в предпросмотре Telegram.
+2. **«Беру в работу»** — подтверждение инцидента.
+3. **«Восстановить»** — закрытие инцидента и сообщение о восстановлении.
+4. Попробуй `/status`, `/incidents`, `/help`, паузу проверки, фильтр проблем и разделы **«Доставка»**, **«Модули»**.
+5. В списке сценариев есть исчезновение формы, близкий срок сертификата и медленный ответ. Медленный ответ меняет график; отдельного latency-инцидента пока нет.
+
+**Демо обозначено явно:** адреса `.example`, сетевые ответы, начальная история и доставка Telegram тестовые. Модули, команды, SQLite, инциденты и очередь общие с рабочим режимом. Демо не вызывает внешние API, работает только на loopback и не предназначено для прямой публикации в интернет.
+
+`npm start` по умолчанию тоже запускает demo. Старый `.env` не читается. По умолчанию базы демонстрации и рабочего бота разделены.
+
+## Подключить нового Telegram-бота
+
+Создай отдельного бота через `@BotFather`, затем:
+
+```powershell
+Copy-Item .env.pulsedesk.example .env.pulsedesk
 ```
 
-Минимальные настройки:
+Заполни `.env.pulsedesk`:
 
-```env
-BOT_TOKEN=your_telegram_bot_token
-API_KEY=your_private_api_key
-OPENROUTER_API_KEY=your_openrouter_api_key
-OPENROUTER_MODEL=openai/gpt-4o-mini
-OPENROUTER_PROVIDER=openai
-OPENROUTER_TRANSCRIPTION_MODEL=openai/gpt-4o-mini-transcribe
-PORT=3000
-BOT_MODE=polling
+```dotenv
+PULSE_MODE=polling
+PULSE_BOT_TOKEN=<токен нового бота>
+PULSE_ALLOWED_USER_IDS=<твой числовой Telegram ID>
+PULSE_ADMIN_API_KEY=<случайный ключ от 32 символов>
+PULSE_HOST=127.0.0.1
+PULSE_PORT=4141
+PULSE_INTERVAL_SECONDS=60
+PULSE_FAILURE_THRESHOLD=2
 ```
 
-## Запуск
+Сгенерировать ключ локально:
 
-```bash
-pnpm start
+```powershell
+node -e "console.log(require('node:crypto').randomBytes(32).toString('hex'))"
 ```
 
-Для разработки:
+Запусти `npm start` и напиши **новому** боту `/start`, чтобы подписаться. В панели нажми значок ключа и введи `PULSE_ADMIN_API_KEY`. Он хранится только в памяти вкладки; в URL и localStorage не записывается. Live API и данные панели закрыты этим ключом.
 
-```bash
-pnpm dev
+Пользователей можно перечислить через запятую. Доступ только им и только в личных чатах. После изменения списка перезапусти сервис; удалённые пользователи лишаются сохранённой подписки. Не публикуй токены, `.env.pulsedesk` и базы.
+
+| Команда | Действие |
+| --- | --- |
+| `/start`, `/help` | Подписка и справка |
+| `/status` | Состояние и короткие ID проверок |
+| `/incidents` | Открытые инциденты и кнопки подтверждения |
+| `/web https://example.com \| Мой сайт` | Проверка доступности |
+| `/watch https://example.com \| Оставить заявку \| Форма` | Контроль фразы |
+| `/tls https://example.com \| Сертификат` | Контроль сертификата |
+| `/check <ID>` | Проверить сейчас, не чаще раза в 10 секунд |
+| `/pause <ID>`, `/resume <ID>` | Пауза и возобновление |
+| `/subscribe`, `/unsubscribe` | Включение и отключение уведомлений |
+
+Разделитель аргументов — `|`. Частичный ID: минимум шесть символов, однозначно определяющих проверку.
+
+## Webhook и внешний сервер
+
+Вместо polling можно выбрать:
+
+```dotenv
+PULSE_MODE=webhook
+PULSE_PUBLIC_ORIGIN=https://pulse.example.com
+PULSE_WEBHOOK_SECRET=<отдельный случайный секрет из букв, цифр, _ и ->
 ```
 
-Проверка синтаксиса:
+Origin — без пути и завершающего `/`. При старте регистрируется `/telegram/webhook`. Секрет обязателен и отличается от API-ключа панели. Update сохраняется в SQLite до ответа HTTP 200; повторный `update_id` не создаёт вторую запись.
 
-```bash
-pnpm check
-```
+TLS завершается на reverse proxy. Оставь Node на `127.0.0.1:4141`, проксируй к нему HTTPS. При выборе внешнего интерфейса приложение требует HTTPS-origin. `/health` показывает готовность фонового процесса; начальная или устаревшая готовность возвращает 503.
 
-## Режимы работы
+Текущая модель — **один владелец/команда, один процесс, до 30 проверок по умолчанию, SQLite на постоянном диске**. Для публичного SaaS нужны изоляция проектов и отдельная приёмка. После аварийного завершения lease процесса может сохраняться до 60 секунд.
 
-`BOT_MODE=polling` — бот получает updates через long polling и отвечает в Telegram.
+## Возможности и границы
 
-`BOT_MODE=webhook` — бот принимает updates на `POST /telegram/webhook`. В `.env` нужно указать публичный HTTPS URL:
+- HTTP-статус и время ответа; 2xx/3xx считаются доступностью, redirect не выполняется.
+- Контент проверяется по фразе в теле ответа 2xx, без исполнения JavaScript страницы.
+- TLS проверяет доверенный сертификат и срок, по умолчанию предупреждая за 14 дней.
+- Два сбоя подряд открывают один инцидент; одна успешная проверка закрывает его.
+- SQLite-outbox: дедупликация события, retry с `retry_after`, восстановление зависшей задачи, очередь ошибок после пяти попыток и ручной повтор.
+- До 720 последних измерений на проверку; завершённые сообщения и инциденты очищаются через 30 дней. Heartbeat и lease ограничивают базу одним фоновым процессом.
+- Только публичный HTTPS:443, без credentials, query и hash. Внутренние, служебные и loopback IP, включая IPv6, запрещены; соединение привязано к проверенному DNS-адресу.
+- DNS ограничен 3 секундами, соединение HTTP/TLS — 7 секундами, тело ответа — 512 КБ. Три последовательные проверки за проход; интервал является целевым расписанием, не точным SLA.
+- Процент успешности считается по последним сохранённым измерениям, не по непрерывно измеренному суточному uptime.
+- Telegram подтверждает принятие сообщения, не прочтение. При аварии между принятием и записью `sent` возможна повторная доставка. Exactly-once не заявляется.
+- Живые токен и домен нового бота не настраивались. Доставка Telegram, реальные inline-кнопки и HTTPS-прокси требуют приёмки с владельцем.
 
-```env
-BOT_MODE=webhook
-WEBHOOK_URL=https://your-domain.example/telegram/webhook
-WEBHOOK_SECRET=long_random_secret
-```
-
-`BOT_MODE=off` — сервер отдаёт HTTP API, но не получает входящие сообщения от Telegram. Удобно для локальных smoke-тестов.
-
-## Примеры запросов
-
-Проверить сервер:
-
-```bash
-curl http://localhost:3000/health
-```
-
-Получить информацию о боте:
-
-```bash
-curl -H "x-api-key: your_private_api_key" http://localhost:3000/getMe
-```
-
-Отправить сообщение через универсальный API:
-
-```bash
-curl -X POST http://localhost:3000/bot/sendMessage ^
-  -H "content-type: application/json" ^
-  -H "x-api-key: your_private_api_key" ^
-  -d "{\"chat_id\":\"123456789\",\"text\":\"Hello from Bot_API\"}"
-```
-
-Отправить фото по URL:
-
-```bash
-curl -X POST http://localhost:3000/bot/sendPhoto ^
-  -H "content-type: application/json" ^
-  -H "Authorization: Bearer your_private_api_key" ^
-  -d "{\"chat_id\":\"123456789\",\"photo\":\"https://example.com/photo.jpg\",\"caption\":\"Photo\"}"
-```
-
-Установить команды:
-
-```bash
-curl.exe -X POST http://localhost:3000/setCommands ^
-  -H "content-type: application/json" ^
-  -H "x-api-key: api_1zx94an7j8I9o0plll" ^
-  -d "{\"commands\":[{\"command\":\"start\",\"description\":\"Start bot\"}]}"
-```
-
-## Универсальный API
-
-Любой метод Telegram Bot API можно вызвать так:
+## Структура
 
 ```text
-POST /bot/<TelegramMethod>
-POST /api/<TelegramMethod>
+src/
+  config.cjs            отдельная конфигурация PulseDesk
+  app.cjs               сборка приложения
+  core/                 SQLite, инциденты, очередь, расписание, сетевая политика
+  modules/              http, content, tls и реестр подключений
+  bot/router.cjs        команды и inline callbacks
+  adapters/telegram.cjs Telegram API и отдельный demo-адаптер
+  http/server.cjs       HTTP API и локальная панель
+  demo/index.cjs        воспроизводимые тестовые сценарии
+public/                 интерфейс без сборщика и внешних ресурсов
+test/                   сценарии и границы доступа
 ```
 
-Для `GET`-запросов параметры берутся из query string. Для `POST`-запросов параметры можно передавать в JSON body и query string; `api_key` из query не пересылается в Telegram.
+## Проверка и материалы
 
-Пример:
-
-```bash
-curl -X POST http://localhost:3000/bot/sendMessage ^
-  -H "content-type: application/json" ^
-  -H "x-api-key: your_private_api_key" ^
-  -d "{\"chat_id\":\"123456789\",\"text\":\"Works\"}"
+```powershell
+npm run verify
+npm audit --omit=dev --ignore-scripts
 ```
 
-## Telegram-бот
+Автотесты используют временные базы, синтетические токены и тестовые сетевые адаптеры. Старый `.env` и внешние сервисы в них не используются. Настоящие HTTP/TLS проверены отдельно на `example.com`.
 
-В режимах `polling` и `webhook` бот также обрабатывает входящие сообщения:
-
-- `/start` — отправляет приветствие
-- `/reset` — сбрасывает контекст диалога
-- любой другой текст — отправляет модели через OpenRouter и отвечает с заданным характером
-
-По умолчанию используется `openai/gpt-4o-mini` с маршрутизацией к провайдеру `openai`. Модель можно поменять через `OPENROUTER_MODEL`, провайдера — через `OPENROUTER_PROVIDER`, а промпт характера — через `BOT_PERSONA_PROMPT`.
-
-## Аудиосообщения
-
-Telegram-бот принимает голосовые сообщения и аудиофайлы. Он скачивает файл из Telegram, распознаёт речь через OpenRouter STT и передаёт полученный текст существующей чат-модели.
-
-По умолчанию используется модель распознавания `openai/gpt-4o-mini-transcribe`. Модель и ограничения можно изменить в `.env`:
-
-
-OPENROUTER_TRANSCRIPTION_MODEL=openai/gpt-4o-mini-transcribe
-OPENROUTER_TRANSCRIPTION_TIMEOUT_MS=60000
-TELEGRAM_AUDIO_MAX_BYTES=20971520
-TELEGRAM_FILE_DOWNLOAD_TIMEOUT_MS=60000
-
-
-## TLS и сертификаты
-
-Node.js-сервер слушает HTTP. Для публичного webhook используй HTTPS на стороне платформы деплоя, nginx, Caddy, Cloudflare Tunnel, Render или другого proxy.
-
-Локальные `key.pem` и `cert.pem` не нужны для запуска этого приложения и добавлены в `.gitignore`, чтобы приватные ключи не попали в репозиторий.
-
-## Общение между ботами
-
-Telegram не передаёт сообщения ботов другим ботам через обычные updates чата. Поэтому приложение поддерживает отдельный защищённый HTTP-протокол для общения совместимых экземпляров.
-
-Настрой текущий экземпляр и разрешённых peer-ботов:
-
-```env
-BOT_NAME=main
-BOT_PEERS_JSON={"helper":{"url":"https://helper-bot.example.com","apiKey":"helper_private_api_key"}}
-BOT_TO_BOT_REQUEST_TIMEOUT_MS=60000
-BOT_TO_BOT_MAX_HOPS=3
-BOT_TO_BOT_MAX_TEXT_LENGTH=10000
-```
-
-Принять сообщение от другого бота:
-
-```bash
-curl.exe -X POST http://localhost:3000/bots/messages ^
-  -H "content-type: application/json" ^
-  -H "x-api-key: api_1zx94an7j8I9o0plllm" ^
-  -d "{\"sender\":\"helper\",\"conversation_id\":\"demo-1\",\"text\":\"Hello\"}"
-``
-$body = @{
-    sender = "@artik_ai_helper_bot"
-    conversation_id = "demo-1"
-    text = "Hello"
-} | ConvertTo-Jsonnpmm
-
-Invoke-RestMethod `
-  -Uri "http://localhost:3000/bots/messages" `
-  -Method POST `
-  -Headers @{ "x-api-key" = "api_1zx94an7j8I9o0plllm" } `
-  -ContentType "application/json" `
-  -Body $body`
-
-Отправить сообщение разрешённому peer-боту:
-
-```bash
-curl -X POST http://localhost:3000/bots/helper/messages ^
-  -H "content-type: application/json" ^
-  -H "x-api-key: your_private_api_key" ^
-  -d "{\"conversation_id\":\"demo-1\",\"text\":\"Hello from main\"}"
-```
-
-Список доступных peer-ботов возвращает `GET /bots`. Из Telegram можно использовать команды `/bots` и `/askbot <имя> <сообщение>`.
+- [`docs/AUDIT_2026-11-03.md`](docs/AUDIT_2026-11-03.md) — аудит прежнего шаблона и выбор направления.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — архитектура и добавление модулей.
+- [`docs/PORTFOLIO_CASE.md`](docs/PORTFOLIO_CASE.md) — текст кейса и сценарий показа.
+- [`docs/VALIDATION_2026-11-03.md`](docs/VALIDATION_2026-11-03.md) — доказательства и границы проверок.
+- `artifacts/screenshots/` — реальные снимки локальной демонстрации.
