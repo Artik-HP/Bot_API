@@ -1,5 +1,6 @@
 'use strict'
 const { validateUrl } = require('../../core/network.cjs')
+const { pageText } = require('../../ai/text.cjs')
 const { fields } = require('../fields.cjs')
 
 module.exports = {
@@ -10,6 +11,6 @@ module.exports = {
   validate(input) { return { target: validateUrl(input.target).href, config: {} } },
   async check(monitor, context) {
     const result = await context.transport.http(monitor.target, { signal: context.signal })
-    return { healthy: result.status >= 200 && result.status < 400, latencyMs: result.latencyMs, summary: `HTTP ${result.status}`, meta: { status: result.status } }
+    return { healthy: result.status >= 200 && result.status < 400, latencyMs: result.latencyMs, summary: `HTTP ${result.status}`, meta: { status: result.status }, evidence: { excerpt: pageText(result.text, 1500) } }
   },
 }

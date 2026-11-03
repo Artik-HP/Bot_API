@@ -1,13 +1,15 @@
 'use strict'
 
 class MonitoringService {
-  constructor({ store, registry, transport, config, now = Date.now }) {
-    Object.assign(this, { store, registry, transport, config, now })
+  constructor({ store, registry, transport, config, ai = null, now = Date.now }) {
+    Object.assign(this, { store, registry, transport, config, ai, now })
     this.running = new Map()
+    this.observers = []
     this.controller = new AbortController()
   }
+  observe(listener) { this.observers.push(listener) }
   add(input) {
-    if (this.config.mode === 'demo') throw new Error('В демо используются три тестовых сервиса. Реальные адреса добавляются в рабочем режиме.')
+    if (this.config.mode === 'demo') throw new Error('В демо используются тестовые сервисы. Реальные адреса добавляются в рабочем режиме.')
     if (this.store.listMonitors().length >= this.config.maxMonitors) throw new Error('Достигнут лимит проверок')
     const monitor = this.registry.create(input, this.config.intervalSeconds)
     try { return this.store.addMonitor(monitor, this.now()) } catch (error) {
@@ -27,13 +29,16 @@ class MonitoringService {
     if (!monitor) throw new Error('Проверка не найдена')
     if (!monitor.enabled) throw new Error('Проверка на паузе')
     let result
-    try { result = await this.registry.get(monitor.kind).check(monitor, { transport: this.transport, now: this.now, signal: this.controller.signal }) } catch (error) {
+    try { result = await this.registry.get(monitor.kind).check(monitor, { transport: this.transport, now: this.now, signal: this.controller.signal, ai: this.ai }) } catch (error) {
       if (this.controller.signal.aborted) return null
       result = { healthy: false, latencyMs: null, summary: safeProbeError(error) }
     }
     if (this.controller.signal.aborted) return null
     if (typeof result?.healthy !== 'boolean' || typeof result?.summary !== 'string') throw new Error('Модуль вернул некорректный результат')
-    return this.store.recordCheck(id, result, this.config.failureThreshold, this.now())
+    const outcome = this.store.recordCheck(id, result, this.config.failureThreshold, this.now())
+    // Observers enrich a committed transition; their failure must not undo or fail the check itself.
+    if (outcome.transition) for (const listener of this.observers) { try { listener({ ...outcome, result }) } catch {} }
+    return outcome
   }
   async due() {
     const due = this.store.listMonitors().filter(monitor => monitor.enabled && monitor.next_due <= this.now()).sort((a, b) => a.next_due - b.next_due).slice(0, 3)

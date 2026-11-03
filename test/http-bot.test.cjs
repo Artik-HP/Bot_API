@@ -30,7 +30,7 @@ test('demo end-to-end: outage → notification → acknowledge → recovery → 
   let response = await fetch(base + '/api/overview')
   const initial = await response.json()
   assert.equal(initial.mode, 'demo')
-  assert.equal(initial.metrics.monitors, 3)
+  assert.equal(initial.metrics.monitors, 4)
   assert.equal(initial.metrics.openIncidents, 0)
   response = await post('/api/demo/scenario', { scenario: 'outage' })
   assert.equal(response.status, 200)

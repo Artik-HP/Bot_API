@@ -43,8 +43,29 @@ class Store {
       CREATE TABLE IF NOT EXISTS leases(name TEXT PRIMARY KEY, owner TEXT NOT NULL, expires_at INTEGER NOT NULL);
     `)
     this.db.prepare('INSERT OR IGNORE INTO migrations VALUES (1, ?)').run(Date.now())
+    this.migrate(2, `ALTER TABLE incidents ADD COLUMN analysis TEXT;
+      CREATE TABLE daily_stats(
+        monitor_id TEXT NOT NULL REFERENCES monitors(id) ON DELETE CASCADE, day TEXT NOT NULL,
+        checks INTEGER NOT NULL DEFAULT 0, ok INTEGER NOT NULL DEFAULT 0,
+        latency_sum INTEGER NOT NULL DEFAULT 0, latency_count INTEGER NOT NULL DEFAULT 0, latency_max INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(monitor_id, day)
+      );
+      CREATE TABLE ai_jobs(
+        id TEXT PRIMARY KEY, dedupe_key TEXT NOT NULL UNIQUE, kind TEXT NOT NULL, payload TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0, next_attempt INTEGER NOT NULL,
+        locked_at INTEGER, result TEXT, error TEXT, created_at INTEGER NOT NULL, finished_at INTEGER
+      );
+      CREATE INDEX ai_queue ON ai_jobs(state, next_attempt);
+      CREATE TABLE ai_usage(day TEXT PRIMARY KEY, calls INTEGER NOT NULL DEFAULT 0, prompt_tokens INTEGER NOT NULL DEFAULT 0,
+        completion_tokens INTEGER NOT NULL DEFAULT 0, cost REAL NOT NULL DEFAULT 0, skipped INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE ai_cache(key TEXT PRIMARY KEY, value TEXT NOT NULL, created_at INTEGER NOT NULL);
+    `)
   }
 
+  migrate(version, sql) {
+    if (this.db.prepare('SELECT 1 FROM migrations WHERE version=?').get(version)) return
+    this.transaction(() => { this.db.exec(sql); this.db.prepare('INSERT INTO migrations VALUES (?, ?)').run(version, Date.now()) })
+  }
   transaction(fn) {
     this.db.exec('BEGIN IMMEDIATE')
     try { const value = fn(); this.db.exec('COMMIT'); return value } catch (error) { this.db.exec('ROLLBACK'); throw error }
@@ -85,6 +106,11 @@ class Store {
         .run(id, now, Number(result.healthy), result.latencyMs ?? null, result.summary.slice(0, 500), JSON.stringify(result.meta || {}))
       this.db.prepare('UPDATE monitors SET status=?, failures=?, last_checked=?, next_due=?, latency_ms=?, summary=? WHERE id=?')
         .run(status, failures, now, now + monitor.interval_seconds * 1000, result.latencyMs ?? null, result.summary.slice(0, 500), id)
+      const latency = Number.isFinite(result.latencyMs) ? Math.round(result.latencyMs) : null
+      this.db.prepare(`INSERT INTO daily_stats(monitor_id,day,checks,ok,latency_sum,latency_count,latency_max) VALUES(?,?,1,?,?,?,?)
+        ON CONFLICT(monitor_id,day) DO UPDATE SET checks=checks+1, ok=ok+excluded.ok, latency_sum=latency_sum+excluded.latency_sum,
+        latency_count=latency_count+excluded.latency_count, latency_max=MAX(latency_max,excluded.latency_max)`)
+        .run(id, new Date(now).toISOString().slice(0, 10), Number(result.healthy), latency ?? 0, latency === null ? 0 : 1, latency ?? 0)
       let incident = this.db.prepare('SELECT * FROM incidents WHERE monitor_id=? AND resolved_at IS NULL').get(id)
       let transition = null
       if (!result.healthy && failures >= threshold && !incident) {
@@ -105,7 +131,51 @@ class Store {
   acknowledge(id, actor, now = Date.now()) {
     return this.db.prepare('UPDATE incidents SET acknowledged_at=?, acknowledged_by=? WHERE id=? AND resolved_at IS NULL AND acknowledged_at IS NULL').run(now, String(actor).slice(0, 80), id).changes > 0
   }
-  incidents(limit = 60) { return this.db.prepare('SELECT i.*,m.name AS monitor_name,m.kind FROM incidents i JOIN monitors m ON m.id=i.monitor_id ORDER BY (i.resolved_at IS NOT NULL),i.opened_at DESC LIMIT ?').all(limit) }
+  incidents(limit = 60) { return this.db.prepare('SELECT i.*,m.name AS monitor_name,m.kind FROM incidents i JOIN monitors m ON m.id=i.monitor_id ORDER BY (i.resolved_at IS NOT NULL),i.opened_at DESC LIMIT ?').all(limit).map(incidentRow) }
+  getIncident(id) { const row = this.db.prepare('SELECT i.*,m.name AS monitor_name,m.kind FROM incidents i JOIN monitors m ON m.id=i.monitor_id WHERE i.id=?').get(id); return row ? incidentRow(row) : null }
+  incidentsSince(from) { return this.db.prepare('SELECT i.*,m.name AS monitor_name,m.kind FROM incidents i JOIN monitors m ON m.id=i.monitor_id WHERE i.opened_at>=? OR i.resolved_at IS NULL OR i.resolved_at>=? ORDER BY i.opened_at').all(from, from).map(incidentRow) }
+  setIncidentAnalysis(id, analysis) { this.db.prepare('UPDATE incidents SET analysis=? WHERE id=?').run(JSON.stringify(analysis), id) }
+  dailyStats(fromDay, toDay) {
+    return this.db.prepare('SELECT monitor_id, SUM(checks) AS checks, SUM(ok) AS ok, SUM(latency_sum) AS latency_sum, SUM(latency_count) AS latency_count, MAX(latency_max) AS latency_max FROM daily_stats WHERE day BETWEEN ? AND ? GROUP BY monitor_id').all(fromDay, toDay)
+  }
+  subscribers() { return this.db.prepare('SELECT chat_id FROM subscribers ORDER BY created_at').all().map(row => row.chat_id) }
+  enqueueMessage(chatId, dedupeKey, kind, payload, now = Date.now()) {
+    return this.db.prepare('INSERT OR IGNORE INTO outbox(id,dedupe_key,chat_id,kind,payload,next_attempt,created_at) VALUES(?,?,?,?,?,?,?)')
+      .run(randomUUID(), dedupeKey, String(chatId), kind, JSON.stringify(payload), now, now).changes > 0
+  }
+  broadcast(kind, dedupeBase, payload, now = Date.now()) { for (const chatId of this.subscribers()) this.enqueueMessage(chatId, `${dedupeBase}:${chatId}`, kind, payload, now) }
+  enqueueAiJob(kind, dedupeKey, payload, now = Date.now()) {
+    return this.db.prepare('INSERT OR IGNORE INTO ai_jobs(id,dedupe_key,kind,payload,next_attempt,created_at) VALUES(?,?,?,?,?,?)')
+      .run(randomUUID(), dedupeKey, kind, JSON.stringify(payload), now, now).changes > 0
+  }
+  claimAiJob(now = Date.now()) {
+    return this.transaction(() => {
+      const job = this.db.prepare("SELECT * FROM ai_jobs WHERE (state='pending' AND next_attempt<=?) OR (state='running' AND locked_at<?) ORDER BY created_at LIMIT 1").get(now, now - 180000)
+      if (!job) return null
+      this.db.prepare("UPDATE ai_jobs SET state='running', attempts=attempts+1, locked_at=? WHERE id=?").run(now, job.id)
+      return { ...job, attempts: job.attempts + 1, payload: JSON.parse(job.payload) }
+    })
+  }
+  finishAiJob(id, result, now = Date.now()) { this.db.prepare("UPDATE ai_jobs SET state='done', result=?, error=NULL, finished_at=? WHERE id=?").run(JSON.stringify(result ?? null), now, id) }
+  skipAiJob(id, code, now = Date.now()) { this.db.prepare("UPDATE ai_jobs SET state='skipped', error=?, finished_at=? WHERE id=?").run(String(code).slice(0, 60), now, id) }
+  failAiJob(job, code, now = Date.now()) {
+    this.db.prepare('UPDATE ai_jobs SET state=?, next_attempt=?, error=?, finished_at=? WHERE id=?')
+      .run(job.attempts >= 3 ? 'failed' : 'pending', now + 30000 * 2 ** job.attempts, String(code).slice(0, 60), job.attempts >= 3 ? now : null, job.id)
+  }
+  releaseAiJob(id) { this.db.prepare("UPDATE ai_jobs SET state='pending', attempts=MAX(0,attempts-1), locked_at=NULL WHERE id=? AND state='running'").run(id) }
+  aiJobs(limit = 12) {
+    return this.db.prepare('SELECT id,kind,payload,state,attempts,result,error,created_at,finished_at FROM ai_jobs ORDER BY created_at DESC LIMIT ?').all(limit)
+      .map(row => ({ ...row, payload: JSON.parse(row.payload), result: row.result ? JSON.parse(row.result) : null }))
+  }
+  aiUsage(day) { return this.db.prepare('SELECT * FROM ai_usage WHERE day=?').get(day) || { day, calls: 0, prompt_tokens: 0, completion_tokens: 0, cost: 0, skipped: 0 } }
+  recordAiUsage(day, usage) {
+    this.db.prepare(`INSERT INTO ai_usage(day,calls,prompt_tokens,completion_tokens,cost) VALUES(?,1,?,?,?) ON CONFLICT(day) DO UPDATE SET
+      calls=calls+1, prompt_tokens=prompt_tokens+excluded.prompt_tokens, completion_tokens=completion_tokens+excluded.completion_tokens, cost=cost+excluded.cost`)
+      .run(day, usage.prompt || 0, usage.completion || 0, usage.cost || 0)
+  }
+  recordAiSkip(day) { this.db.prepare('INSERT INTO ai_usage(day,skipped) VALUES(?,1) ON CONFLICT(day) DO UPDATE SET skipped=skipped+1').run(day) }
+  aiCacheGet(key) { const row = this.db.prepare('SELECT value FROM ai_cache WHERE key=?').get(key); return row ? JSON.parse(row.value) : null }
+  aiCacheSet(key, value, now = Date.now()) { this.db.prepare('INSERT INTO ai_cache VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, created_at=excluded.created_at').run(key, JSON.stringify(value), now) }
   history(id, limit = 48) { return this.db.prepare('SELECT checked_at,healthy,latency_ms,summary FROM checks WHERE monitor_id=? ORDER BY id DESC LIMIT ?').all(id, limit).reverse() }
   claimDelivery(now = Date.now()) {
     return this.transaction(() => {
@@ -151,7 +221,14 @@ class Store {
     this.db.prepare("DELETE FROM telegram_updates WHERE created_at<? AND (state='done' OR attempts>=3)").run(cutoff)
     this.db.prepare("DELETE FROM outbox WHERE created_at<? AND state IN ('sent','cancelled')").run(cutoff)
     this.db.prepare('DELETE FROM incidents WHERE resolved_at<?').run(cutoff)
+    this.db.prepare("DELETE FROM ai_jobs WHERE created_at<? AND state IN ('done','failed','skipped')").run(cutoff)
+    this.db.prepare('DELETE FROM ai_cache WHERE created_at<?').run(cutoff)
+    const statsCutoff = new Date(now - 120 * 86400000).toISOString().slice(0, 10)
+    this.db.prepare('DELETE FROM daily_stats WHERE day<?').run(statsCutoff)
+    this.db.prepare('DELETE FROM ai_usage WHERE day<?').run(statsCutoff)
   }
 }
+
+function incidentRow(row) { return { ...row, analysis: row.analysis ? JSON.parse(row.analysis) : null } }
 
 module.exports = { Store }

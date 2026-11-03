@@ -10,6 +10,11 @@ let apiKey = ''
 let toastTimer
 let refreshing = false
 let currentModuleList = []
+const moduleIcons = { http: '⌁', content: '▣', tls: '♧', 'ai-page': '✦' }
+const severity = { high: 'срочно', medium: 'средняя срочность', low: 'не срочно' }
+const aiKinds = { incident: '🧠 Разбор инцидента', digest: '📊 Отчёт', ask: '💬 Вопрос', scan: '🔎 Подбор проверок' }
+const aiStates = { pending: ['В очереди', 'neutral'], running: ['Модель думает', 'neutral'], done: ['Готово', 'good'], failed: ['Ошибка', 'bad'], skipped: ['Пропущено', 'bad'] }
+const aiErrors = { BUDGET: 'Дневной лимит AI исчерпан', AI_DISABLED: 'AI выключен', NO_CREDITS: 'Закончились средства OpenRouter', UNAUTHORIZED: 'OpenRouter отклонил ключ', TIMEOUT: 'Модель не ответила вовремя', RATE_LIMITED: 'OpenRouter просит подождать' }
 
 function toast(message, error = false) {
   const element = $('#toast')
@@ -38,8 +43,8 @@ async function action(button, path, payload, success) {
 
 function navigate() {
   const view = location.hash.slice(1) || 'overview'
-  const safe = ['overview', 'incidents', 'deliveries', 'modules'].includes(view) ? view : 'overview'
-  const titles = { overview: ['Контрольная комната', 'Твои сервисы работают. Ты занимаешься своим делом.', 'Обзор'], incidents: ['Инциденты', 'Заметить. Подтвердить. Дождаться восстановления.', 'Инциденты'], deliveries: ['Доставка сообщений', 'Каждый сигнал сохраняется до отправки.', 'Доставка'], modules: ['Больше возможностей', 'Новая задача — новый модуль. Ядро остаётся общим.', 'Модули'] }
+  const safe = ['overview', 'incidents', 'deliveries', 'modules', 'ai'].includes(view) ? view : 'overview'
+  const titles = { overview: ['Контрольная комната', 'Твои сервисы работают. Ты занимаешься своим делом.', 'Обзор'], incidents: ['Инциденты', 'Заметить. Подтвердить. Дождаться восстановления.', 'Инциденты'], deliveries: ['Доставка сообщений', 'Каждый сигнал сохраняется до отправки.', 'Доставка'], modules: ['Больше возможностей', 'Новая задача — новый модуль. Ядро остаётся общим.', 'Модули'], ai: ['AI-ассистент', 'Объясняет сбои, проверяет смысл страниц и пишет отчёты.', 'AI-ассистент'] }
   const [title, description, crumb] = titles[safe]
   $('#page-title').textContent = `${title} /`
   $('#page-description').textContent = description
@@ -54,15 +59,22 @@ function monitorRows() {
   if (!monitors.length) return `<div class="empty"><span class="empty-icon">◉</span><strong>${filter === 'issues' ? 'Всё спокойно' : 'Пока нет проверок'}</strong><p>${filter === 'issues' ? 'Проверки не обнаружили проблем.' : 'Добавь сайт через панель или Telegram-команду /web.'}</p></div>`
   return monitors.map(m => {
     const status = !m.enabled ? 'Пауза' : m.status === 'down' ? 'Сбой' : m.failures ? 'Проверяем' : m.status === 'up' ? 'В норме' : 'Ожидание'
-    const icon = { http: '⌁', content: '▣', tls: '♧' }[m.kind] || '◇'
+    const icon = moduleIcons[m.kind] || '◇'
     const bars = m.history.slice(-15).map(check => `<i class="level-${Math.min(5, Math.max(1, Math.ceil((check.latency_ms || 30) / 120)))} ${check.healthy ? '' : 'failed'}"></i>`).join('')
     return `<div class="monitor-row"><span class="monitor-icon ${escapeHtml(m.kind)}">${icon}</span><div><strong class="monitor-name">${escapeHtml(m.name)}</strong><span class="monitor-target">${escapeHtml(m.target.replace('https://', ''))}</span></div><span class="monitor-status ${!m.enabled ? 'paused' : m.status === 'down' ? 'down' : ''}"><span class="online-dot"></span>${status}</span><span class="sparkbars" aria-hidden="true">${bars}</span><button class="monitor-action" data-monitor="${escapeHtml(m.id)}" data-operation="${m.enabled ? 'pause' : 'resume'}" title="${m.enabled ? 'Приостановить' : 'Возобновить'} проверку" aria-label="${m.enabled ? 'Приостановить' : 'Возобновить'}: ${escapeHtml(m.name)}">${m.enabled ? 'Ⅱ' : '▷'}</button></div>`
   }).join('')
 }
 
-function incidentRows(items) {
+function analysisBlock(incident, detailed) {
+  const a = incident.analysis
+  if (a) return `<div class="ai-note"><span class="pill ai">✦ AI · ${escapeHtml(severity[a.severity] || a.severity)}</span><p>${escapeHtml(a.cause)}</p>${detailed && a.steps.length ? `<ol>${a.steps.map(step => `<li>${escapeHtml(step)}</li>`).join('')}</ol>` : ''}</div>`
+  const pending = state.ai?.jobs.some(job => job.kind === 'incident' && job.incidentId === incident.id && ['pending', 'running'].includes(job.state))
+  return pending ? '<div class="ai-note pending"><span class="pill ai">✦ AI</span><p>Модель разбирает инцидент…</p></div>' : ''
+}
+
+function incidentRows(items, detailed = false) {
   if (!items.length) return '<div class="empty"><span class="empty-icon">✓</span><strong>Хорошие новости: инцидентов пока нет.</strong><p>Когда что-то произойдёт, вся история появится здесь.</p></div>'
-  return items.map(i => `<article class="event-row"><span class="event-dot ${i.resolved_at ? '' : 'down'}"></span><div class="event-content"><strong>${escapeHtml(i.monitor_name)} <span class="pill ${i.resolved_at ? 'good' : 'bad'}">${i.resolved_at ? 'Восстановлено' : 'Открыт'}</span></strong><p>${escapeHtml(i.summary)}</p>${i.resolved_at ? `<span class="event-ack">Восстановлен ${dateTime(i.resolved_at)}</span>` : i.acknowledged_at ? `<span class="event-ack">✓ Принят в работу · ${clock(i.acknowledged_at)}</span>` : `<button class="ack-button" data-ack="${escapeHtml(i.id)}">✋ Беру в работу</button>`}</div><time class="event-time">${dateTime(i.opened_at)}</time></article>`).join('')
+  return items.map(i => `<article class="event-row"><span class="event-dot ${i.resolved_at ? '' : 'down'}"></span><div class="event-content"><strong>${escapeHtml(i.monitor_name)} <span class="pill ${i.resolved_at ? 'good' : 'bad'}">${i.resolved_at ? 'Восстановлено' : 'Открыт'}</span></strong><p>${escapeHtml(i.summary)}</p>${analysisBlock(i, detailed)}${i.resolved_at ? `<span class="event-ack">Восстановлен ${dateTime(i.resolved_at)}</span>` : i.acknowledged_at ? `<span class="event-ack">✓ Принят в работу · ${clock(i.acknowledged_at)}</span>` : `<button class="ack-button" data-ack="${escapeHtml(i.id)}">✋ Беру в работу</button>`}</div><time class="event-time">${dateTime(i.opened_at)}</time></article>`).join('')
 }
 
 function renderChart() {
@@ -107,16 +119,18 @@ function render() {
   const latest = Math.max(0, ...state.monitors.map(m => m.last_checked || 0))
   $('#last-check').textContent = `Последняя проверка · ${clock(latest)}`
   $('#recent-incidents').innerHTML = incidentRows(state.incidents.slice(0, 3))
-  $('#all-incidents').innerHTML = incidentRows(state.incidents)
+  $('#all-incidents').innerHTML = incidentRows(state.incidents, true)
   const labels = { sent: demo ? 'Демо: обработано' : 'Telegram принял', pending: 'В очереди', sending: 'Отправляется', dead: 'Не доставлено', cancelled: 'Отменено' }
-  $('#all-deliveries').innerHTML = state.deliveries.length ? state.deliveries.map(item => `<article class="event-row"><span class="event-dot ${item.state === 'dead' ? 'down' : ''}"></span><div class="event-content"><strong>${escapeHtml(item.payload.monitorName)} · ${item.kind === 'opened' ? 'Сбой' : 'Восстановление'}</strong><p>${escapeHtml(item.payload.summary)}</p><div class="delivery-meta"><span class="pill ${item.state === 'dead' ? 'bad' : item.state === 'sent' ? 'good' : 'neutral'}">${labels[item.state] || escapeHtml(item.state)}</span><span>Попыток: ${item.attempts}</span></div>${item.state === 'dead' ? `<button class="ack-button" data-retry="${escapeHtml(item.id)}">Повторить доставку</button>` : ''}</div><time class="event-time">${dateTime(item.created_at)}</time></article>`).join('') : '<div class="empty"><span class="empty-icon">↗</span><strong>Очередь пуста</strong><p>При сбое и восстановлении здесь появятся уведомления.</p></div>'
+  const deliveryKinds = { opened: 'Сбой', resolved: 'Восстановление', analysis: 'AI-разбор', message: 'Сообщение' }
+  $('#all-deliveries').innerHTML = state.deliveries.length ? state.deliveries.map(item => `<article class="event-row"><span class="event-dot ${item.state === 'dead' ? 'down' : ''}"></span><div class="event-content"><strong>${escapeHtml(item.payload.monitorName || item.payload.title)} · ${deliveryKinds[item.kind] || escapeHtml(item.kind)}</strong><p>${escapeHtml(item.payload.summary || '')}</p><div class="delivery-meta"><span class="pill ${item.state === 'dead' ? 'bad' : item.state === 'sent' ? 'good' : 'neutral'}">${labels[item.state] || escapeHtml(item.state)}</span><span>Попыток: ${item.attempts}</span></div>${item.state === 'dead' ? `<button class="ack-button" data-retry="${escapeHtml(item.id)}">Повторить доставку</button>` : ''}</div><time class="event-time">${dateTime(item.created_at)}</time></article>`).join('') : '<div class="empty"><span class="empty-icon">↗</span><strong>Очередь пуста</strong><p>При сбое и восстановлении здесь появятся уведомления.</p></div>'
   if (!currentModuleList.length) {
     currentModuleList = state.modules
-    $('#module-list').innerHTML = state.modules.map(m => `<article class="module-card"><span class="monitor-icon ${escapeHtml(m.id)}">${{ http: '⌁', content: '▣', tls: '♧' }[m.id] || '◇'}</span><h3>${escapeHtml(m.title)}</h3><p>${escapeHtml(m.description)}</p><footer><code>${escapeHtml(m.command)}</code><span>● Подключён</span></footer></article>`).join('')
+    $('#module-list').innerHTML = state.modules.map(m => `<article class="module-card"><span class="monitor-icon ${escapeHtml(m.id)}">${moduleIcons[m.id] || '◇'}</span><h3>${escapeHtml(m.title)}</h3><p>${escapeHtml(m.description)}</p><footer><code>${escapeHtml(m.command)}</code><span>● Подключён</span></footer></article>`).join('')
     $('#module-select').innerHTML = state.modules.map(m => `<option value="${escapeHtml(m.id)}">${escapeHtml(m.title)}</option>`).join('')
     renderModuleFields()
-    $('.nav-badge').textContent = state.modules.length
+    $('#module-badge').textContent = state.modules.length
   }
+  renderAi()
   renderChart()
   const messages = state.demoMessages
   const messageKey = messages.map(m => m.id).join(',')
@@ -125,6 +139,32 @@ function render() {
     $('#telegram-messages').innerHTML = messages.length ? messages.slice(-15).map(m => `<div class="message ${m.direction === 'in' ? 'in' : ''}">${escapeHtml(m.text)}<time>${clock(m.created_at)}${m.direction === 'out' ? ' ✓✓' : ''}</time></div>`).join('') : '<div class="message">Бот готов. Уведомления получают пользователи, которые отправили /start или /subscribe.</div>'
     $('#telegram-messages').scrollTop = $('#telegram-messages').scrollHeight
   }
+}
+
+function renderAi() {
+  const ai = state.ai
+  if (!ai) return
+  $('#ai-badge').textContent = ai.enabled ? 'on' : 'off'
+  $('#ai-model').textContent = ai.model.replace(/^[^/]+\//, '')
+  $('#ai-model').title = ai.model
+  $('#ai-state').textContent = ai.enabled ? 'Подключена' : 'Выключена'
+  $('#ai-state').className = `pill ${ai.enabled ? 'good' : 'neutral'}`
+  $('#ai-reasoning').textContent = ai.enabled ? `Рассуждение: ${ai.reasoning}` : 'Нет ключа OpenRouter'
+  $('#ai-calls').textContent = ai.usage.calls
+  $('#ai-limit').textContent = `/ ${ai.limit}`
+  $('#ai-skipped').textContent = `Пропущено по лимиту: ${ai.usage.skipped}`
+  $('#ai-tokens').textContent = ai.usage.tokens.toLocaleString('ru')
+  $('#ai-cost').textContent = ai.usage.cost.toFixed(4).replace('.', ',')
+  $('#ai-setup').hidden = ai.enabled
+  const report = ai.lastReport
+  $('#ai-report-meta').textContent = report ? `${report.source === 'ai' ? 'AI-сводка' : 'Шаблон'} · ${dateTime(report.createdAt)}` : ai.digest === 'off' ? 'По запросу: кнопка справа или /report' : `Автоматически: ${ai.digest === 'daily' ? 'каждый день' : 'по понедельникам'} в ${ai.digestHour}:00`
+  $('#ai-report').innerHTML = report ? escapeHtml(report.text) : '<div class="empty"><span class="empty-icon">📊</span><strong>Отчётов пока нет</strong><p>Сформируй первый: модель получит статистику за неделю и историю инцидентов.</p></div>'
+  $('#ai-report').classList.toggle('filled', Boolean(report))
+  $('#ai-jobs').innerHTML = ai.jobs.length ? ai.jobs.map(job => {
+    const [label, tone] = aiStates[job.state] || [job.state, 'neutral']
+    const detail = job.result ? `<p class="job-result">${escapeHtml(job.result)}</p>` : job.error ? `<p>${escapeHtml(aiErrors[job.error] || `Код: ${job.error}`)}</p>` : ''
+    return `<article class="event-row"><span class="event-dot ${tone === 'bad' ? 'down' : ''}"></span><div class="event-content"><strong>${aiKinds[job.kind] || escapeHtml(job.kind)} · ${escapeHtml(job.label)}</strong>${detail}<div class="delivery-meta"><span class="pill ${tone}">${label}</span></div></div><time class="event-time">${dateTime(job.created_at)}</time></article>`
+  }).join('') : '<div class="empty"><span class="empty-icon">✦</span><strong>Очередь пуста</strong><p>Задачи появятся после сбоя, /ask, /scan или /report.</p></div>'
 }
 
 async function refresh() {
@@ -181,6 +221,7 @@ $('#restore-button').addEventListener('click', async event => {
   const success = await action(event.currentTarget, '/api/demo/scenario', { scenario: 'healthy' }, 'Тестовые сервисы восстановлены')
   if (success) $('#scenario-state').textContent = 'Сценарий: сервисы работают'
 })
+$('#report-button').addEventListener('click', event => action(event.currentTarget, '/api/ai/report', { days: 7 }, 'Отчёт поставлен в очередь: он появится через несколько секунд'))
 $('#command-form').addEventListener('submit', async event => {
   event.preventDefault()
   const text = $('#command-input').value.trim()

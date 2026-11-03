@@ -11,3 +11,23 @@ dialog{background:#1b251d;color:var(--text);border:1px solid #4b5e3d;border-radi
 @media(max-width:580px){:root{--sidebar:0px}.sidebar{position:relative;width:100%;height:66px;flex-direction:row;align-items:center;justify-content:space-between;padding:14px 18px;border-bottom:1px solid var(--line);border-right:0}.brand-mark{width:32px;height:33px}.brand{font-size:0}.nav{flex-direction:row;margin:0;gap:7px}.nav a{padding:10px 13px}.nav-icon{font-size:21px}.sidebar-footer{display:none}.app-shell{margin:0}.topbar{height:47px;padding:0 18px}.topbar-right{gap:10px}.topbar-right>.avatar{display:none}.connection{font-size:8px}.breadcrumb{font-size:9px;gap:8px}main{padding:16px 16px 0}.demo-banner{align-items:flex-start;padding:8px 10px;gap:8px}.demo-banner-icon{display:none}.page-heading{align-items:flex-start;padding:24px 0 20px;flex-direction:column;gap:16px}.page-heading h1{font-size:28px;letter-spacing:-1px}.page-heading p{font-size:10px}.page-heading .button{font-size:10px;min-height:34px}.metrics{gap:8px;margin-bottom:16px}.metric{padding:13px 12px}.metric-title{font-size:9px}.metric-value{font-size:27px}.metric-value small{font-size:12px}.metric-value>.pill{font-size:7px;padding:2px 4px}.metric p{font-size:8px}.panel-heading{padding:16px 14px;gap:7px}.panel-heading h2{font-size:12px}.panel-heading p{font-size:9px}.segmented button{font-size:8px;padding:4px 6px}.monitor-row{grid-template-columns:28px minmax(0,1fr) auto 25px;padding:14px 13px;gap:8px}.sparkbars{display:none}.monitor-name{font-size:10px}.monitor-target{font-size:8px;max-width:145px}.monitor-status{font-size:8px}.monitor-icon{width:27px;height:29px}.panel-foot{font-size:7px;padding:10px 13px}.right-column{grid-template-columns:1fr;gap:16px}.demo-controls{padding:20px}.demo-controls h2 br{display:none}.demo-controls h2{font-size:23px}.demo-buttons{flex-direction:row}.demo-controls p{margin-bottom:12px}.telegram-messages{height:260px}.telegram-heading h2{font-size:12px}.message{font-size:11px}.command-chips button{font-size:10px}#command-form input{font-size:11px}.main-column{gap:16px}.chart-wrap{height:135px}.chart-wrap svg{height:130px}.chart-legend{font-size:7px}.event-row{padding:14px}.event-content strong{font-size:10px}.event-content p{font-size:9px}.event-time{font-size:7px}.toast{left:50%;bottom:18px;font-size:11px}.module-intro{padding-top:10px;gap:15px}.module-symbol{width:55px;height:60px;font-size:36px;border-radius:10px}.module-intro h2{font-size:20px}.module-intro p{font-size:10px}.module-extension{padding:18px;gap:12px}.module-extension p{font-size:10px}.module-extension button{margin-left:0}.module-extension h3{font-size:12px}.module-extension>div{flex:1}.dialog-shell{padding:28px 23px}.dialog-shell h2{font-size:23px}.dialog-shell p{font-size:11px}}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{transition:none!important;scroll-behavior:auto!important}}
 .sparkbars i.level-1{height:6px}.sparkbars i.level-2{height:10px}.sparkbars i.level-3{height:14px}.sparkbars i.level-4{height:19px}.sparkbars i.level-5{height:23px}
+.monitor-icon.ai-page{background:#2f2a3a;border-color:#463d56;color:#d3c1f2}
+.command-chips{flex-wrap:wrap}
+.pill.ai{color:#d8c8f5;background:#3a3150}
+.ai-note{margin-top:9px;border:1px solid #3d3650;background:#221f2b;border-radius:6px;padding:9px 11px}
+.ai-note p{margin:6px 0 0;font-size:10px;color:#c9c0da;line-height:1.6}
+.ai-note ol{margin:6px 0 0;padding-left:17px;font-size:10px;color:#a99fbd;line-height:1.6}
+.ai-note.pending p{color:#9286a8}
+.ai-note.pending .pill{animation:ai-pulse 1.6s ease-in-out infinite}
+@keyframes ai-pulse{50%{opacity:.45}}
+.ai-model{font-size:20px;letter-spacing:-.4px;overflow-wrap:anywhere}
+.report-text{padding:0 20px 20px;font-size:11px;line-height:1.75;color:#cbd8c2}
+.report-text.filled{white-space:pre-wrap;overflow-wrap:anywhere}
+.job-result{white-space:pre-wrap;overflow-wrap:anywhere;color:#a9b8a3!important}
+.skill-list{list-style:none;margin:0;padding:0 20px 8px}
+.skill-list li{border-top:1px solid #2a342c;padding:11px 0;display:flex;flex-direction:column;gap:3px}
+.skill-list strong{font-size:11px;font-weight:500}
+.skill-list span{font-size:10px;color:#83917e;line-height:1.6}
+.skill-list code,.ai-setup code{color:#d3c1f2;font-size:10px}
+.ai-setup{margin:0 20px 20px;padding:11px 12px;border:1px dashed #4b4560;border-radius:6px;font-size:10px;color:#b6abc9;line-height:1.7}
+@media(prefers-reduced-motion:reduce){.ai-note.pending .pill{animation:none}}

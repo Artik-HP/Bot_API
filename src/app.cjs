@@ -10,6 +10,8 @@ const { TelegramTransport, DemoTelegramTransport } = require('./adapters/telegra
 const { BotRouter } = require('./bot/router.cjs')
 const { seedDemo, createDemoTransport } = require('./demo/index.cjs')
 const { createHttpServer } = require('./http/server.cjs')
+const { OpenRouterClient } = require('./ai/openrouter.cjs')
+const { AiService } = require('./ai/service.cjs')
 
 function createApplication(config, overrides = {}) {
   const store = overrides.store || new Store(config.database)
@@ -20,13 +22,16 @@ function createApplication(config, overrides = {}) {
   }
   const transport = overrides.transport || (config.mode === 'demo' ? createDemoTransport(store) : { http: inspectHttp, tls: inspectTls })
   const telegram = overrides.telegram || (config.mode === 'demo' ? new DemoTelegramTransport(store) : new TelegramTransport(config.token))
-  const monitoring = new MonitoringService({ store, registry, transport, config })
+  const client = 'aiClient' in overrides ? overrides.aiClient : config.ai?.enabled ? new OpenRouterClient(config.ai) : null
+  const ai = new AiService({ store, client, config, registry, transport })
+  const monitoring = new MonitoringService({ store, registry, transport, config, ai })
+  monitoring.observe(event => ai.onTransition(event))
   const notifications = new NotificationWorker(store, telegram)
-  const bot = new BotRouter({ store, monitoring, registry, telegram, config })
-  const runtime = new Runtime({ store, monitoring, notifications, bot, telegram, config })
-  const server = createHttpServer({ config, store, monitoring, registry, notifications, bot, runtime })
+  const bot = new BotRouter({ store, monitoring, registry, telegram, config, ai })
+  const runtime = new Runtime({ store, monitoring, notifications, bot, telegram, config, ai })
+  const server = createHttpServer({ config, store, monitoring, registry, notifications, bot, runtime, ai })
   return {
-    store, registry, monitoring, notifications, bot, telegram, runtime, server,
+    store, registry, monitoring, notifications, bot, telegram, runtime, server, ai,
     async start() {
       try {
         await new Promise((resolve, reject) => { server.once('error', reject); server.listen(config.port, config.host, resolve) })

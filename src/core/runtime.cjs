@@ -4,8 +4,9 @@ const { randomUUID } = require('node:crypto')
 const { setTimeout: delay } = require('node:timers/promises')
 
 class Runtime {
-  constructor({ store, monitoring, notifications, bot, telegram, config }) {
-    Object.assign(this, { store, monitoring, notifications, bot, telegram, config })
+  constructor({ store, monitoring, notifications, bot, telegram, config, ai = null }) {
+    Object.assign(this, { store, monitoring, notifications, bot, telegram, config, ai })
+    this.aiTask = null
     this.owner = randomUUID()
     this.controller = new AbortController()
     this.lastTick = null
@@ -43,8 +44,18 @@ class Runtime {
     }
     await this.monitoring.due()
     await this.notifications.drain()
+    this.ai?.schedule()
+    this.kickAi()
     this.lastTick = Date.now()
     this.lastError = null
+  }
+  // Model calls take seconds, so they run beside the loop instead of delaying checks and deliveries.
+  kickAi() {
+    if (!this.ai || this.aiTask || this.controller.signal.aborted) return
+    this.aiTask = this.ai.drain(3, this.controller.signal)
+      .then(() => this.notifications.drain())
+      .catch(() => { this.lastError = 'AI_TASK_FAILED' })
+      .finally(() => { this.aiTask = null })
   }
   async loop() {
     while (!this.controller.signal.aborted) {
@@ -69,7 +80,7 @@ class Runtime {
     clearInterval(this.heartbeat)
     this.monitoring.stop()
     this.controller.abort()
-    await Promise.allSettled([this.pollTask, this.loopTask].filter(Boolean))
+    await Promise.allSettled([this.pollTask, this.loopTask, this.aiTask].filter(Boolean))
     this.store.releaseLease(this.owner)
   }
 }

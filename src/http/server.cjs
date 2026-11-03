@@ -33,7 +33,7 @@ async function readJson(request) {
   return result
 }
 
-function createHttpServer({ config, store, monitoring, registry, notifications, bot, runtime }) {
+function createHttpServer({ config, store, monitoring, registry, notifications, bot, runtime, ai = null }) {
   const rate = new Map()
   let scenarioBusy = false
   function authorized(request) {
@@ -83,7 +83,7 @@ function createHttpServer({ config, store, monitoring, registry, notifications, 
         // ACK only after SQLite has durably accepted this update. Worker handles it afterwards.
         json(200, { ok: true }); return
       }
-      if (request.method === 'GET' && pathname === '/api/overview') { authorized(request); json(200, monitoring.overview()); return }
+      if (request.method === 'GET' && pathname === '/api/overview') { authorized(request); json(200, { ...monitoring.overview(), ai: ai?.overview() || null }); return }
       if (request.method === 'GET' && pathname === '/api/modules') { json(200, { modules: registry.list(), mode: config.mode }); return }
       if (!pathname.startsWith('/api/') || request.method !== 'POST') throw httpError(404, 'Маршрут не найден')
       authorized(request)
@@ -91,7 +91,7 @@ function createHttpServer({ config, store, monitoring, registry, notifications, 
       const body = await readJson(request)
       if (pathname === '/api/demo/scenario') {
         if (config.mode !== 'demo') throw httpError(404, 'Демонстрация отключена')
-        if (!['healthy', 'outage', 'content', 'certificate', 'slow'].includes(body.scenario)) throw httpError(400, 'Неизвестный сценарий')
+        if (!['healthy', 'outage', 'content', 'certificate', 'slow', 'semantic'].includes(body.scenario)) throw httpError(400, 'Неизвестный сценарий')
         if (scenarioBusy) throw httpError(409, 'Предыдущий сценарий ещё выполняется')
         scenarioBusy = true
         try {
@@ -100,15 +100,26 @@ function createHttpServer({ config, store, monitoring, registry, notifications, 
             for (const monitor of store.listMonitors().filter(m => m.enabled)) await monitoring.run(monitor.id)
           }
           await notifications.drain()
+          runtime.kickAi()
           json(200, { ok: true, scenario: body.scenario })
         } finally { scenarioBusy = false }
         return
+      }
+      if (pathname === '/api/ai/report') {
+        const days = body.days ?? 7
+        if (!Number.isInteger(days) || days < 1 || days > 30) throw httpError(400, 'Период отчёта: от 1 до 30 дней')
+        if (!ai) throw httpError(404, 'Отчёты недоступны')
+        // In the demo the report also lands in the Telegram preview; live dashboards keep it on the AI page.
+        ai.requestReport({ chatId: config.mode === 'demo' ? '900001' : null, days })
+        runtime.kickAi()
+        json(202, { ok: true }); return
       }
       if (pathname === '/api/demo/command') {
         if (config.mode !== 'demo') throw httpError(404, 'Демонстрация отключена')
         if (typeof body.text !== 'string' || body.text.length > 1500) throw httpError(400, 'Команда слишком длинная')
         store.addDemoMessage('in', body.text)
         await bot.handle({ message: { message_id: 1, chat: { id: 900001, type: 'private' }, from: { id: 900001 }, text: body.text } })
+        runtime.kickAi()
         json(200, { ok: true }); return
       }
       if (pathname === '/api/monitors') { const monitor = monitoring.add(body); json(201, { ok: true, monitor }); return }

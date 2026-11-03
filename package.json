@@ -9,7 +9,8 @@
     "demo": "node index.js --demo",
     "check": "node scripts/check.cjs",
     "test": "node --test",
-    "verify": "npm run check && npm test"
+    "verify": "npm run check && npm test",
+    "ai:smoke": "node scripts/ai-smoke.cjs"
   },
   "keywords": [],
   "author": "",

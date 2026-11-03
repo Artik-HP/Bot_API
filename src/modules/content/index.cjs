@@ -1,5 +1,6 @@
 'use strict'
 const { validateUrl } = require('../../core/network.cjs')
+const { pageText } = require('../../ai/text.cjs')
 const { fields } = require('../fields.cjs')
 
 module.exports = {
@@ -15,6 +16,6 @@ module.exports = {
   async check(monitor, context) {
     const result = await context.transport.http(monitor.target, { signal: context.signal })
     const healthy = result.status >= 200 && result.status < 300 && result.text.includes(monitor.config.text)
-    return { healthy, latencyMs: result.latencyMs, summary: healthy ? 'Контрольная фраза на месте' : 'Страница недоступна или контрольная фраза пропала', meta: { status: result.status } }
+    return { healthy, latencyMs: result.latencyMs, summary: healthy ? 'Контрольная фраза на месте' : 'Страница недоступна или контрольная фраза пропала', meta: { status: result.status }, evidence: { excerpt: pageText(result.text, 1500) } }
   },
 }

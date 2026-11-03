@@ -1,11 +1,30 @@
 'use strict'
 
+const { validateUrl } = require('../core/network.cjs')
+
 const menu = { reply_markup: { inline_keyboard: [[{ text: '◉ Статус', callback_data: 'status' }, { text: '⚡ Инциденты', callback_data: 'incidents' }]] } }
 
 class BotRouter {
-  constructor({ store, monitoring, registry, telegram, config }) {
-    Object.assign(this, { store, monitoring, registry, telegram, config })
+  constructor({ store, monitoring, registry, telegram, config, ai = null }) {
+    Object.assign(this, { store, monitoring, registry, telegram, config, ai })
     this.lastManualCheck = new Map()
+    this.lastAiRequest = new Map()
+  }
+  throttle(chatId) {
+    if ((this.lastAiRequest.get(chatId) || 0) + 15000 > Date.now()) throw new Error('AI-запросы — не чаще раза в 15 секунд')
+    this.lastAiRequest.set(chatId, Date.now())
+  }
+  requireAi(chatId) {
+    if (!this.ai?.enabled) throw new Error('AI не подключён: укажи PULSE_OPENROUTER_API_KEY в .env.pulsedesk')
+    this.throttle(chatId)
+  }
+  addSuggestion(id, index) {
+    const item = this.store.aiCacheGet(`scan:${id}`)?.suggestions?.[index]
+    if (!item) return 'Предложение устарело: запусти /scan ещё раз'
+    try {
+      const monitor = this.monitoring.add({ kind: item.kind, name: item.name, target: item.target, config: item.config })
+      return `✓ Добавлено: ${monitor.name} · ${monitor.id.slice(0, 8)}`
+    } catch (error) { return `Не получилось: ${error.message}` }
   }
   allowed(userId) { return this.config.mode === 'demo' ? String(userId) === '900001' : this.config.allowedUsers.has(String(userId)) }
   async handle(update) {
@@ -21,8 +40,10 @@ class BotRouter {
       if (callback.data === 'incidents') { await this.incidents(chatId); text = 'Инциденты загружены' }
       const match = /^ack:([a-f0-9-]{36})$/.exec(callback.data || '')
       if (match) text = this.store.acknowledge(match[1], from.id) ? 'Инцидент принят в работу' : 'Уже принят или закрыт'
-      await this.telegram.call('answerCallbackQuery', { callback_query_id: callback.id, text })
-      if (match) await this.telegram.sendMessage(chatId, text, menu)
+      const suggestion = /^scan:([a-f0-9]{8}):([0-4])$/.exec(callback.data || '')
+      if (suggestion) text = this.addSuggestion(suggestion[1], Number(suggestion[2]))
+      await this.telegram.call('answerCallbackQuery', { callback_query_id: callback.id, text: text.slice(0, 190) })
+      if (match || suggestion) await this.telegram.sendMessage(chatId, text, menu)
       return
     }
     if (typeof message.text !== 'string' || message.text.length > 1500) return
@@ -33,7 +54,7 @@ class BotRouter {
     try {
       if (command === '/start') {
         this.store.subscribe(chatId)
-        await this.telegram.sendMessage(chatId, '👋 Это PulseDesk. Я слежу за сайтами, контентом и SSL и сообщаю о сбоях и восстановлении.\n\nУведомления включены. /help — команды, /unsubscribe — отключить.', menu)
+        await this.telegram.sendMessage(chatId, `👋 Это PulseDesk. Я слежу за сайтами, контентом и SSL и сообщаю о сбоях и восстановлении.${this.ai?.enabled ? '\nAI-ассистент объясняет сбои, пишет отчёты и отвечает на /ask.' : ''}\n\nУведомления включены. /help — команды, /unsubscribe — отключить.`, menu)
       } else if (command === '/help') await this.help(chatId)
       else if (command === '/status') await this.status(chatId)
       else if (command === '/incidents') await this.incidents(chatId)
@@ -49,6 +70,23 @@ class BotRouter {
         this.lastManualCheck.set(chatId, Date.now())
         await this.monitoring.run(monitor.id)
         await this.status(chatId)
+      } else if (command === '/ask') {
+        if (!args) throw new Error('Напиши вопрос после команды, например: /ask что сегодня падало?')
+        this.requireAi(chatId)
+        this.ai.requestAnswer(chatId, args)
+        await this.telegram.sendMessage(chatId, '🧠 Думаю над вопросом. Ответ придёт отдельным сообщением.', menu)
+      } else if (command === '/scan') {
+        const target = validateUrl(args).href
+        this.requireAi(chatId)
+        this.ai.requestScan(chatId, target)
+        await this.telegram.sendMessage(chatId, `🔎 Изучаю ${target} и подбираю проверки…`, menu)
+      } else if (command === '/report') {
+        const days = args ? Number(args) : 7
+        if (!Number.isInteger(days) || days < 1 || days > 30) throw new Error('Период отчёта: от 1 до 30 дней, например /report 7')
+        if (!this.ai) throw new Error('Отчёты недоступны')
+        this.throttle(chatId)
+        this.ai.requestReport({ chatId, days })
+        await this.telegram.sendMessage(chatId, this.ai.enabled ? `🧠 Готовлю AI-отчёт за ${days} дн.…` : `📊 Готовлю отчёт за ${days} дн.…`, menu)
       } else {
         const plugin = [...this.registry.items.values()].find(item => item.command === command && item.fromCommand)
         if (!plugin) { await this.help(chatId); return }
@@ -71,12 +109,13 @@ class BotRouter {
     const active = this.store.incidents().filter(i => !i.resolved_at)
     if (!active.length) { await this.telegram.sendMessage(chatId, '🟢 Открытых инцидентов нет', menu); return }
     for (const incident of active.slice(0, 5)) {
-      await this.telegram.sendMessage(chatId, `🔴 ${incident.monitor_name}\n${incident.summary}\n${incident.acknowledged_at ? '✓ Принят в работу' : 'Ожидает подтверждения'}`, { reply_markup: { inline_keyboard: [[{ text: '✋ Беру в работу', callback_data: `ack:${incident.id}` }]] } })
+      await this.telegram.sendMessage(chatId, `🔴 ${incident.monitor_name}\n${incident.summary}${incident.analysis ? `\n🧠 ${incident.analysis.cause}` : ''}\n${incident.acknowledged_at ? '✓ Принят в работу' : 'Ожидает подтверждения'}`, { reply_markup: { inline_keyboard: [[{ text: '✋ Беру в работу', callback_data: `ack:${incident.id}` }]] } })
     }
   }
   async help(chatId) {
     const modules = [...this.registry.items.values()].map(plugin => `${plugin.command} — ${plugin.title}`).join('\n')
-    await this.telegram.sendMessage(chatId, `PulseDesk — контроль сайтов и инцидентов\n\n/status — состояние и ID проверок\n/incidents — открытые инциденты\n/check <ID> — проверить сейчас\n/pause <ID> · /resume <ID>\n/subscribe · /unsubscribe\n\nМодули:\n${modules}\n\nПримеры:\n/web https://example.com | Мой сайт\n/watch https://example.com | Оставить заявку | Форма\n/tls https://example.com | SSL сайта\n\n${this.config.mode === 'demo' ? 'ДЕМО: используются тестовые сервисы и тестовая доставка.' : 'Добавлять проверки могут только разрешённые пользователи.'}`, menu)
+    const ai = `AI-ассистент${this.ai?.enabled ? '' : ' (выключен: нет PULSE_OPENROUTER_API_KEY)'}:\n/ask <вопрос> — спросить о состоянии сервисов\n/report [дней] — отчёт за период\n/scan <адрес> — подобрать проверки для страницы`
+    await this.telegram.sendMessage(chatId, `PulseDesk — контроль сайтов и инцидентов\n\n/status — состояние и ID проверок\n/incidents — открытые инциденты\n/check <ID> — проверить сейчас\n/pause <ID> · /resume <ID>\n/subscribe · /unsubscribe\n\nМодули:\n${modules}\n\n${ai}\n\nПримеры:\n/web https://example.com | Мой сайт\n/watch https://example.com | Оставить заявку | Форма\n/tls https://example.com | SSL сайта\n/ai https://example.com/pricing | Указаны цены и есть форма заявки | Прайс\n\n${this.config.mode === 'demo' ? 'ДЕМО: используются тестовые сервисы и тестовая доставка.' : 'Добавлять проверки могут только разрешённые пользователи.'}`, menu)
   }
 }
 
